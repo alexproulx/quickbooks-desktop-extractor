@@ -4,31 +4,64 @@ QBExtract.py — QuickBooks Desktop Data Extractor
 Reads data directly from a running QuickBooks Desktop/Enterprise company file
 via the QB SDK (QBXML) and produces a single JSON bundle for import.
 
+What's new in v2 (2026-05):
+  - **ASCII normalization** of every text field. Real-world QB files have
+    Windows-1252 smart punctuation, Latin-1 supplement chars, and stray
+    high-bit bytes that the SDK silently rejects on round-trip. The extractor
+    now decodes XML entities, remaps CP1252 control-range chars to ASCII, and
+    strips anything outside 7-bit ASCII. Necessary for migrating corrupt files.
+  - **Full Chart of Accounts** — Account hierarchy with ParentRef preserved.
+    Previous version omitted accounts entirely.
+  - **All item types** — Service, OtherCharge, and Discount items in addition
+    to Inventory + Non-Inventory. Transactions reference these (Fuel Surcharge,
+    Shipping, Pick-Up Credit, etc.) and silently fail on import if missing.
+  - **Customer jobs** — sub-customers now retained with `parent` field
+    pointing at the parent's FullName. v1 dropped them entirely.
+  - **Ship Methods + Payment Methods + Sales Tax Codes + Sales Tax Items** —
+    new master tables. Transactions reference them; without them, import
+    rejects with "invalid reference" errors.
+  - **Sales tax fields on invoices + credit memos** — subtotal, sales tax
+    total, tax item (jurisdiction), tax code, per-line tax codes. The push
+    side needs these to reconstruct tax accurately.
+  - **Bill line typing** — expense lines vs item lines are now distinguished
+    (`line_type` field). They're separate XML schemas on push.
+  - **Date range filters** — `--from-date YYYY-MM-DD`, `--to-date YYYY-MM-DD`,
+    `--year YYYY` for surgical re-extracts when patching a specific period.
+  - **Name-range chunking** for Customers and Items. A corrupt record in one
+    alphabetic bucket only loses that bucket instead of failing the whole
+    query. Works on clean files too; no flag needed.
+
 Requirements:
   - QuickBooks Desktop/Enterprise must be OPEN with the company file loaded
   - QuickBooks SDK must be installed (comes with QB or download from Intuit)
   - No Python or pywin32 needed when compiled to EXE (uses VBScript for COM)
 
 Usage:
-  python QBExtract.py
+  python QBExtract.py                    # interactive, prompts for years
+  python QBExtract.py --years 3          # last 3 years
+  python QBExtract.py --years 0          # all history
+  python QBExtract.py --year 2024        # only 2024
+  python QBExtract.py --from-date 2024-01-01 --to-date 2024-06-30
   (or compiled to QBExtract.exe via PyInstaller)
 
 Output:
-  <CompanyName>_export_<YYYYMMDD>.json  in the same folder as this script
+  <CompanyName>_export_<YYYYMMDD>.json  in the current directory
 
 Compile to EXE:
   pip install pyinstaller
   pyinstaller --onefile --console QBExtract.py
 """
 
-import os
-import sys
-import json
+import argparse
 import datetime
-import traceback
-
+import html
+import json
+import os
+import re
 import subprocess
+import sys
 import tempfile
+import traceback
 
 
 # ============================================================================
@@ -113,7 +146,7 @@ ElseIf action = "query" Then
 
     envelope = "<?xml version=""1.0"" encoding=""utf-8""?>" & _
                "<?qbxml version=""13.0""?>" & _
-               "<QBXML><QBXMLMsgsRq onError=""stopOnError"">" & _
+               "<QBXML><QBXMLMsgsRq onError=""continueOnError"">" & _
                reqXml & _
                "</QBXMLMsgsRq></QBXML>"
 
@@ -189,12 +222,10 @@ class QBSession:
 
     def _run_vbs(self, action):
         """Run the VBScript bridge and return the response."""
-        # Ensure req/res files exist
         if not os.path.exists(self._req_path):
             with open(self._req_path, 'w') as f:
                 f.write('')
 
-        # Clear response file
         with open(self._res_path, 'w') as f:
             f.write('')
 
@@ -202,7 +233,7 @@ class QBSession:
             proc = subprocess.run(
                 ['cscript', '//Nologo', self._vbs_path,
                  action, self._req_path, self._res_path],
-                capture_output=True, text=True, timeout=300
+                capture_output=True, text=True, timeout=600
             )
         except FileNotFoundError:
             raise RuntimeError("cscript.exe not found — Windows Script Host may be disabled")
@@ -237,7 +268,6 @@ class QBSession:
 
     def _parse_company_name(self, xml):
         """Extract company name from CompanyQueryRs."""
-        import re
         m = re.search(r'<CompanyName>(.*?)</CompanyName>', xml)
         return m.group(1) if m else 'UnknownCompany'
 
@@ -248,28 +278,22 @@ class QBSession:
 
 def xml_val(xml, tag, default=''):
     """Extract first value of a tag from XML string."""
-    import re
     m = re.search(rf'<{tag}>(.*?)</{tag}>', xml, re.DOTALL)
     return m.group(1).strip() if m else default
 
 
 def xml_all(xml, tag):
     """Extract all occurrences of a tag."""
-    import re
     return re.findall(rf'<{tag}>(.*?)</{tag}>', xml, re.DOTALL)
 
 
 def xml_blocks(xml, tag):
     """Extract all blocks between opening and closing tags."""
-    import re
     return re.findall(rf'<{tag}[\s>].*?</{tag}>', xml, re.DOTALL)
 
 
 def xml_ref(xml, ref_tag, sub_tag='FullName'):
-    """Extract a sub-tag from a Ref block, e.g. CustomerRef -> FullName.
-    QB returns nested refs like <CustomerRef><FullName>X</FullName></CustomerRef>
-    """
-    import re
+    """Extract a sub-tag from a Ref block, e.g. CustomerRef -> FullName."""
     m = re.search(rf'<{ref_tag}>(.*?)</{ref_tag}>', xml, re.DOTALL)
     if not m:
         return ''
@@ -278,16 +302,55 @@ def xml_ref(xml, ref_tag, sub_tag='FullName'):
     return m2.group(1).strip() if m2 else ''
 
 
+# ============================================================================
+# ASCII NORMALIZATION
+# ============================================================================
+#
+# Real-world QB files accumulate text data from many sources over decades:
+# Windows clipboards, Word/Excel imports, OCR, scanner inputs, etc. By the
+# time it lands in QB, the strings may contain:
+#   * Windows-1252 control-range chars (0x80-0x9F): smart quotes, em dash, etc.
+#   * Already-decoded Unicode general punctuation (U+2013, U+2018, etc.)
+#   * Latin-1 supplement (0xA0-0xFF): non-breaking space, degree sign, accents
+#
+# QB SDK qbXML v13 silently rejects entire batches containing any of these.
+# The error message is generic ("Invalid argument") and unrelated to the
+# offending field. We have to normalize every string to 7-bit ASCII before
+# either writing JSON or pushing back.
+
+_ASCII_REMAP = {
+    # Windows-1252 control range (`&#150;` etc. decode here first)
+    '\x80': 'EUR', '\x82': ',',  '\x83': 'f',  '\x84': '"',
+    '\x85': '...','\x86': '+',   '\x87': '++', '\x88': '^',
+    '\x89': '%o', '\x8A': 'S',   '\x8B': '<',  '\x8C': 'OE',
+    '\x8E': 'Z',  '\x91': "'",   '\x92': "'",  '\x93': '"',
+    '\x94': '"',  '\x95': '*',   '\x96': '-',  '\x97': '--',
+    '\x98': '~',  '\x99': '(TM)','\x9A': 's',  '\x9B': '>',
+    '\x9C': 'oe', '\x9E': 'z',   '\x9F': 'Y',
+    # Common Unicode general-punctuation already-decoded equivalents
+    '–': '-', '—': '--', '‘': "'", '’': "'",
+    '‚': ',', '“': '"',  '”': '"', '„': '"',
+    '•': '*', '…': '...','‰': '%o','‹': '<',
+    '›': '>', '™': '(TM)',
+    # Latin-1 supplement chars QB also rejects
+    ' ': ' ', '·': '.', '°': 'deg', '´': "'",
+}
+
+
 def clean(s):
-    """Strip whitespace and XML entities."""
+    """Strip whitespace, decode XML entities, ASCII-normalize. Three layered
+    sanitizations: html.unescape converts `&apos;`/`&#150;` to real chars
+    (otherwise re-escape on push doubles `&apos;` -> `&amp;apos;` and overflows
+    QB's 41-char Name); _ASCII_REMAP swaps known smart-punctuation for ASCII
+    equivalents; final strip drops any remaining char outside 7-bit ASCII (QB
+    SDK 13 rejects whole batches containing them, even valid UTF-8)."""
     if not s:
         return ''
-    return (s.strip()
-            .replace('&amp;', '&')
-            .replace('&lt;', '<')
-            .replace('&gt;', '>')
-            .replace('&quot;', '"')
-            .replace('&#39;', "'"))
+    out = html.unescape(s.strip())
+    for k, v in _ASCII_REMAP.items():
+        if k in out:
+            out = out.replace(k, v)
+    return ''.join(ch for ch in out if 0x20 <= ord(ch) < 0x7F or ch in '\t\n\r')
 
 
 def to_float(s):
@@ -298,31 +361,92 @@ def to_float(s):
 
 
 # ============================================================================
-# EXTRACTORS
+# CHUNKING HELPERS
 # ============================================================================
 
-def extract_customers(session):
-    """Pull all customers with address, terms, price level, balance."""
-    print("  Extracting customers...")
-    request = """
-    <CustomerQueryRq requestID="2">
-      <ActiveStatus>All</ActiveStatus>
-      <OwnerID>0</OwnerID>
-    </CustomerQueryRq>
-    """
+def _name_range_chunks():
+    """Alphabetic name-range chunks for Customer/Item queries. Each chunk uses
+    inclusive FromName + an upper bound that's the next prefix + 'zzzzz', so
+    names like 'Acme', 'Adams' all fall into the 'A' bucket.
+
+    Why: a single CustomerQuery on a corrupt file may abort partway through
+    because of one bad record. Chunking by name range isolates damage to a
+    single alphabetic bucket — you lose 1/36th of the master at worst, instead
+    of everything after the corrupt record."""
+    ranges = []
+    for c in '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ':
+        ranges.append((c, c + 'zzzzz'))
+    return ranges
+
+
+def _build_date_chunks(years_back, date_range):
+    """Return list of (from_date, to_date) pairs to iterate. If date_range is
+    supplied, returns exactly one window covering that range. Otherwise builds
+    backward year chunks."""
+    if date_range is not None:
+        return [date_range]
+    today = datetime.date.today()
+    max_years = 30 if years_back == 0 else years_back
+    chunks = []
+    for i in range(max_years):
+        chunk_end   = today - datetime.timedelta(days=365 * i)
+        chunk_start = today - datetime.timedelta(days=365 * (i + 1))
+        chunks.append((chunk_start.strftime('%Y-%m-%d'),
+                       chunk_end.strftime('%Y-%m-%d')))
+    return chunks
+
+
+def _txn_date_filter(from_d, to_d):
+    """Build a TxnDateRangeFilter block. Either endpoint may be None/empty."""
+    parts = ['      <TxnDateRangeFilter>']
+    if from_d:
+        parts.append(f'        <FromTxnDate>{from_d}</FromTxnDate>')
+    if to_d:
+        parts.append(f'        <ToTxnDate>{to_d}</ToTxnDate>')
+    parts.append('      </TxnDateRangeFilter>')
+    return '\n'.join(parts)
+
+
+# ============================================================================
+# EXTRACTORS — MASTERS
+# ============================================================================
+
+def extract_accounts(session):
+    """Pull the chart of accounts. Single query — typical company has <500
+    accounts. Captures the hierarchy via `parent` so the import can rebuild
+    nested accounts in the right order."""
+    print("  Extracting chart of accounts...")
+    request = '<AccountQueryRq requestID="100"><ActiveStatus>All</ActiveStatus></AccountQueryRq>'
     xml = session._send(request)
-    blocks = xml_blocks(xml, 'CustomerRet')
+    out = []
+    for b in xml_blocks(xml, 'AccountRet'):
+        out.append({
+            'list_id':        clean(xml_val(b, 'ListID')),
+            'name':           clean(xml_val(b, 'Name')),
+            'full_name':      clean(xml_val(b, 'FullName')),
+            'parent':         clean(xml_ref(b, 'ParentRef', 'FullName')),
+            'account_type':   clean(xml_val(b, 'AccountType')),
+            'special_type':   clean(xml_val(b, 'SpecialAccountType')),
+            'account_number': clean(xml_val(b, 'AccountNumber')),
+            'description':    clean(xml_val(b, 'Desc')),
+            'active':         xml_val(b, 'IsActive') == 'true',
+        })
+    print(f"    {len(out)} accounts found")
+    return out
+
+
+def _parse_customer_blocks(blocks):
+    """Parse <CustomerRet> blocks into customer dicts. Sub-customers (jobs)
+    are included; their `parent` field carries the parent's FullName so the
+    push can recreate the hierarchy with ParentRef."""
     customers = []
     for b in blocks:
-        # Skip sub-customers (jobs) — they have a ParentRef
-        if '<ParentRef>' in b:
-            continue
-        # Extract address from BillAddress sub-block to avoid mixing with ShipAddress
         bill_blocks = xml_blocks(b, 'BillAddress')
         bill = bill_blocks[0] if bill_blocks else ''
-        cust = {
+        customers.append({
             'list_id':      clean(xml_val(b, 'ListID')),
             'name':         clean(xml_val(b, 'Name')),
+            'parent':       clean(xml_ref(b, 'ParentRef', 'FullName')),
             'company':      clean(xml_val(b, 'CompanyName')),
             'contact':      clean(xml_val(b, 'FirstName') + ' ' + xml_val(b, 'LastName')).strip(),
             'phone':        clean(xml_val(b, 'Phone')),
@@ -343,142 +467,203 @@ def extract_customers(session):
             'active':       xml_val(b, 'IsActive') == 'true',
             'notes':        clean(xml_val(b, 'Notes')),
             'account_no':   clean(xml_val(b, 'AccountNumber')),
-        }
-        customers.append(cust)
-
-    print(f"    {len(customers)} customers found")
+        })
     return customers
 
 
-def extract_items(session):
-    """Pull all inventory items and non-inventory items with all price levels."""
-    print("  Extracting items...")
+def extract_customers(session, corrupt_safe=False):
+    """Pull all customers via name-range chunks (parents AND jobs).
 
-    # Pull inventory items
-    request_inv = """
-    <ItemInventoryQueryRq requestID="3">
-      <ActiveStatus>All</ActiveStatus>
-      <OwnerID>0</OwnerID>
-    </ItemInventoryQueryRq>
-    """
-    # Pull non-inventory items (services, etc.)
-    request_non = """
-    <ItemNonInventoryQueryRq requestID="4">
-      <ActiveStatus>All</ActiveStatus>
-      <OwnerID>0</OwnerID>
-    </ItemNonInventoryQueryRq>
-    """
+    `corrupt_safe`: when True, narrows the response to non-history fields only.
+    Excluding Balance keeps the SDK from walking each customer's transaction
+    ledger to compute the balance — which is what trips on corrupt records.
+    The trade-off is `balance` comes back as 0 in the JSON; recompute it
+    later from invoices - payments if needed."""
+    print("  Extracting customers (chunked by name range)...")
+    if corrupt_safe:
+        include_elements = ''.join(
+            f"      <IncludeRetElement>{e}</IncludeRetElement>\n" for e in [
+                'ListID', 'Name', 'FullName', 'IsActive', 'ParentRef',
+                'CompanyName', 'FirstName', 'LastName', 'Phone', 'Fax', 'Email',
+                'BillAddress', 'ShipAddress', 'TermsRef', 'SalesRepRef',
+                'PriceLevelRef', 'CustomerTaxCodeRef', 'CreditLimit',
+                'Notes', 'AccountNumber', 'JobStatus',
+            ]
+        )
+    else:
+        include_elements = ''
 
+    all_custs = []
+    for from_name, to_name in _name_range_chunks():
+        # qbxml v13 schema order: ActiveStatus, NameRangeFilter, IncludeRetElement, OwnerID
+        request = f"""
+    <CustomerQueryRq requestID="2">
+      <ActiveStatus>All</ActiveStatus>
+      <NameRangeFilter>
+        <FromName>{from_name}</FromName>
+        <ToName>{to_name}</ToName>
+      </NameRangeFilter>
+{include_elements}      <OwnerID>0</OwnerID>
+    </CustomerQueryRq>
+    """
+        try:
+            xml = session._send(request)
+            chunk = _parse_customer_blocks(xml_blocks(xml, 'CustomerRet'))
+            if chunk:
+                print(f"    {from_name}*: {len(chunk)} customers")
+            all_custs.extend(chunk)
+        except Exception as e:
+            print(f"    {from_name}*: FAILED -- {str(e)[:100]}")
+
+    print(f"    {len(all_custs)} customers found total")
+    return all_custs
+
+
+def _parse_item_blocks(blocks, item_type):
+    """Parse Item*Ret blocks. Same shape regardless of inventory/service/etc."""
     items = []
-
-    for req, item_type in [(request_inv, 'INV'), (request_non, 'NON')]:
-        xml = session._send(req)
-        tag = 'ItemInventoryRet' if item_type == 'INV' else 'ItemNonInventoryRet'
-        blocks = xml_blocks(xml, tag)
-        for b in blocks:
-            item = {
-                'list_id':      clean(xml_val(b, 'ListID')),
-                'item':         clean(xml_val(b, 'Name')),
-                'description':  clean(xml_val(b, 'SalesDesc') or xml_val(b, 'Desc')),
-                'item_type':    item_type,
-                'active':       xml_val(b, 'IsActive') == 'true',
-                'price':        to_float(xml_val(b, 'SalesPrice')),
-                'cost':         to_float(xml_val(b, 'PurchaseCost')),
-                'on_hand':      to_float(xml_val(b, 'QuantityOnHand')),
-                'on_order':     to_float(xml_val(b, 'QuantityOnOrder')),
-                'reorder_pt':   to_float(xml_val(b, 'ReorderPoint')),
-                'unitms':       clean(xml_ref(b, 'UnitOfMeasureSetRef', 'FullName')),
-                'income_acct':  clean(xml_ref(b, 'IncomeAccountRef', 'FullName')),
-                'asset_acct':   clean(xml_ref(b, 'AssetAccountRef', 'FullName')),
-                'cogs_acct':    clean(xml_ref(b, 'COGSAccountRef', 'FullName')),
-                'item_group':   clean(xml_ref(b, 'ParentRef', 'FullName')),
-                'barcode':      clean(xml_val(b, 'BarCodeValue')),
-            }
-            items.append(item)
-
-    print(f"    {len(items)} items found")
+    for b in blocks:
+        items.append({
+            'list_id':      clean(xml_val(b, 'ListID')),
+            'item':         clean(xml_val(b, 'Name')),
+            'description':  clean(xml_val(b, 'SalesDesc') or xml_val(b, 'Desc')),
+            'item_type':    item_type,
+            'active':       xml_val(b, 'IsActive') == 'true',
+            'price':        to_float(xml_val(b, 'SalesPrice')),
+            'cost':         to_float(xml_val(b, 'PurchaseCost')),
+            'on_hand':      to_float(xml_val(b, 'QuantityOnHand')),
+            'on_order':     to_float(xml_val(b, 'QuantityOnOrder')),
+            'reorder_pt':   to_float(xml_val(b, 'ReorderPoint')),
+            'unitms':       clean(xml_ref(b, 'UnitOfMeasureSetRef', 'FullName')),
+            'income_acct':  clean(xml_ref(b, 'IncomeAccountRef', 'FullName')),
+            'asset_acct':   clean(xml_ref(b, 'AssetAccountRef', 'FullName')),
+            'cogs_acct':    clean(xml_ref(b, 'COGSAccountRef', 'FullName')),
+            'item_group':   clean(xml_ref(b, 'ParentRef', 'FullName')),
+            'barcode':      clean(xml_val(b, 'BarCodeValue')),
+        })
     return items
 
 
-def extract_price_levels(session):
-    """Pull all price levels (Enterprise feature).
-    Returns:
-      - price_levels: list of {name, type, pct, fixed_prices: [{item_list_id, price}]}
-    ERP supports 5 tiers (A-E); extras are exported and the importer
-    will store them as customer-specific price_exceptions.
-    """
-    print("  Extracting price levels...")
-    request = """
-    <PriceLevelQueryRq requestID="5">
+def extract_items(session, corrupt_safe=False):
+    """Pull every item type the SDK exposes: Inventory, Non-Inventory, Service,
+    OtherCharge, Discount. All five share the same JSON shape via `item_type`.
+
+    Special-type items (Service/OtherCharge/Discount) are pulled in a single
+    query each (typical count <50). Inventory + Non-Inventory use name-range
+    chunking for corrupt-file safety.
+
+    `corrupt_safe`: when True, omits QuantityOnHand/QuantityOnOrder on
+    Inventory queries — those fields force the SDK to walk the inventory
+    ledger, which is where corrupt transaction records live."""
+    print("  Extracting items (chunked by name range)...")
+
+    if corrupt_safe:
+        inv_includes = ''.join(
+            f"      <IncludeRetElement>{e}</IncludeRetElement>\n" for e in [
+                'ListID', 'Name', 'FullName', 'IsActive', 'ParentRef',
+                'SalesDesc', 'SalesPrice', 'PurchaseCost', 'ReorderPoint',
+                'UnitOfMeasureSetRef', 'IncomeAccountRef', 'AssetAccountRef',
+                'COGSAccountRef', 'BarCodeValue',
+            ]
+        )
+        non_includes = ''.join(
+            f"      <IncludeRetElement>{e}</IncludeRetElement>\n" for e in [
+                'ListID', 'Name', 'FullName', 'IsActive', 'ParentRef',
+                'SalesDesc', 'SalesPrice', 'PurchaseCost',
+                'UnitOfMeasureSetRef', 'IncomeAccountRef', 'BarCodeValue',
+            ]
+        )
+    else:
+        inv_includes = non_includes = ''
+
+    all_items = []
+    for item_type, query_tag, ret_tag, includes in [
+        ('INV', 'ItemInventoryQueryRq',    'ItemInventoryRet',    inv_includes),
+        ('NON', 'ItemNonInventoryQueryRq', 'ItemNonInventoryRet', non_includes),
+        ('SVC', 'ItemServiceQueryRq',      'ItemServiceRet',      ''),
+        ('OCH', 'ItemOtherChargeQueryRq',  'ItemOtherChargeRet',  ''),
+        ('DSC', 'ItemDiscountQueryRq',     'ItemDiscountRet',     ''),
+    ]:
+        # Special-type items: single query, no name-range chunking
+        if item_type in ('SVC', 'OCH', 'DSC'):
+            request = f'<{query_tag} requestID="3"><ActiveStatus>All</ActiveStatus></{query_tag}>'
+            try:
+                xml = session._send(request)
+                chunk = _parse_item_blocks(xml_blocks(xml, ret_tag), item_type)
+                if chunk:
+                    print(f"    {item_type}: {len(chunk)} items")
+                all_items.extend(chunk)
+            except Exception as e:
+                print(f"    {item_type}: FAILED -- {str(e)[:100]}")
+            continue
+
+        # Inventory + Non-Inventory: name-range chunked
+        for from_name, to_name in _name_range_chunks():
+            request = f"""
+    <{query_tag} requestID="3">
       <ActiveStatus>All</ActiveStatus>
-    </PriceLevelQueryRq>
+      <NameRangeFilter>
+        <FromName>{from_name}</FromName>
+        <ToName>{to_name}</ToName>
+      </NameRangeFilter>
+{includes}      <OwnerID>0</OwnerID>
+    </{query_tag}>
     """
+            try:
+                xml = session._send(request)
+                chunk = _parse_item_blocks(xml_blocks(xml, ret_tag), item_type)
+                if chunk:
+                    print(f"    {item_type} {from_name}*: {len(chunk)} items")
+                all_items.extend(chunk)
+            except Exception as e:
+                print(f"    {item_type} {from_name}*: FAILED -- {str(e)[:100]}")
+
+    print(f"    {len(all_items)} items found total")
+    return all_items
+
+
+def extract_price_levels(session):
+    """Pull all price levels (Enterprise feature)."""
+    print("  Extracting price levels...")
+    request = '<PriceLevelQueryRq requestID="5"><ActiveStatus>All</ActiveStatus></PriceLevelQueryRq>'
     xml = session._send(request)
-    blocks = xml_blocks(xml, 'PriceLevelRet')
     price_levels = []
-
-    for b in blocks:
-        pl_name = clean(xml_val(b, 'Name'))
-        pl_type = clean(xml_val(b, 'PriceLevelType'))  # 'FixedPercentage' or 'PerItem'
-        pct      = to_float(xml_val(b, 'PriceLevelFixedPct'))
-
-        # Per-item price overrides (Enterprise feature)
+    for b in xml_blocks(xml, 'PriceLevelRet'):
         fixed_prices = []
-        item_blocks = xml_blocks(b, 'PriceLevelPerItemRet')
-        for ib in item_blocks:
+        for ib in xml_blocks(b, 'PriceLevelPerItemRet'):
             fixed_prices.append({
                 'item_list_id':  clean(xml_ref(ib, 'ItemRef', 'ListID')),
                 'item_name':     clean(xml_ref(ib, 'ItemRef', 'FullName')),
                 'custom_price':  to_float(xml_val(ib, 'CustomPrice')),
                 'custom_pct':    to_float(xml_val(ib, 'CustomPricePercent')),
             })
-
         price_levels.append({
-            'name':         pl_name,
-            'type':         pl_type,
-            'pct':          pct,
+            'name':         clean(xml_val(b, 'Name')),
+            'type':         clean(xml_val(b, 'PriceLevelType')),
+            'pct':          to_float(xml_val(b, 'PriceLevelFixedPct')),
             'fixed_prices': fixed_prices,
         })
-
     print(f"    {len(price_levels)} price levels found")
-    if len(price_levels) > 5:
-        print(f"    NOTE: ERP supports 5 price tiers (A-E). {len(price_levels) - 5} extra levels")
-        print(f"          will be imported as customer-specific price exceptions.")
     return price_levels
 
 
 def extract_quantity_discounts(session):
-    """Pull quantity-discount items from QB (ItemDiscount + ItemGroup with qty breaks).
-    QB doesn't expose Enterprise Price Rules via QBXML, but we can extract:
-      - ItemDiscount entries (flat discount items applied on invoices)
-      - ItemGroup entries (bundles that imply qty pricing)
-    Returns list of {item_list_id, item_name, discount_rate, discount_type}
-    """
+    """Pull discount items. Note: same query as Discount items in extract_items;
+    kept here for backward compatibility with v1 JSON consumers."""
     print("  Extracting quantity discounts...")
-
-    # Discount items (used on invoices for line-level discounts)
-    request = """
-    <ItemDiscountQueryRq requestID="11">
-      <ActiveStatus>All</ActiveStatus>
-    </ItemDiscountQueryRq>
-    """
+    request = '<ItemDiscountQueryRq requestID="11"><ActiveStatus>All</ActiveStatus></ItemDiscountQueryRq>'
     xml = session._send(request)
-    blocks = xml_blocks(xml, 'ItemDiscountRet')
     discounts = []
-
-    for b in blocks:
-        rate = to_float(xml_val(b, 'DiscountRate'))
-        pct  = to_float(xml_val(b, 'DiscountRatePercent'))
+    for b in xml_blocks(xml, 'ItemDiscountRet'):
         discounts.append({
             'list_id':       clean(xml_val(b, 'ListID')),
             'item_name':     clean(xml_val(b, 'Name')),
             'description':   clean(xml_val(b, 'ItemDesc')),
-            'discount_rate': rate,
-            'discount_pct':  pct,
+            'discount_rate': to_float(xml_val(b, 'DiscountRate')),
+            'discount_pct':  to_float(xml_val(b, 'DiscountRatePercent')),
             'account':       clean(xml_ref(b, 'AccountRef', 'FullName')),
             'active':        xml_val(b, 'IsActive') == 'true',
         })
-
     print(f"    {len(discounts)} discount items found")
     return discounts
 
@@ -486,15 +671,10 @@ def extract_quantity_discounts(session):
 def extract_vendors(session):
     """Pull all vendors."""
     print("  Extracting vendors...")
-    request = """
-    <VendorQueryRq requestID="6">
-      <ActiveStatus>All</ActiveStatus>
-    </VendorQueryRq>
-    """
+    request = '<VendorQueryRq requestID="6"><ActiveStatus>All</ActiveStatus></VendorQueryRq>'
     xml = session._send(request)
-    blocks = xml_blocks(xml, 'VendorRet')
     vendors = []
-    for b in blocks:
+    for b in xml_blocks(xml, 'VendorRet'):
         vendors.append({
             'list_id':   clean(xml_val(b, 'ListID')),
             'name':      clean(xml_val(b, 'Name')),
@@ -518,24 +698,140 @@ def extract_vendors(session):
     return vendors
 
 
+def extract_sales_reps(session):
+    """Pull sales rep list."""
+    print("  Extracting sales reps...")
+    request = '<SalesRepQueryRq requestID="8"><ActiveStatus>All</ActiveStatus></SalesRepQueryRq>'
+    xml = session._send(request)
+    reps = []
+    for b in xml_blocks(xml, 'SalesRepRet'):
+        reps.append({
+            'initial': clean(xml_val(b, 'Initial')),
+            'name':    clean(xml_ref(b, 'SalesRepEntityRef', 'FullName')),
+            'active':  xml_val(b, 'IsActive') == 'true',
+        })
+    print(f"    {len(reps)} sales reps found")
+    return reps
+
+
+def extract_terms(session):
+    """Pull payment terms (Standard + DateDriven)."""
+    print("  Extracting payment terms...")
+    request = '<TermsQueryRq requestID="9"><ActiveStatus>All</ActiveStatus></TermsQueryRq>'
+    xml = session._send(request)
+    terms = []
+    for b in xml_blocks(xml, 'StandardTermsRet'):
+        terms.append({
+            'name':      clean(xml_val(b, 'Name')),
+            'type':      'Standard',
+            'net_days':  int(xml_val(b, 'NetDays') or '0'),
+            'disc_days': int(xml_val(b, 'DiscountDays') or '0'),
+            'disc_pct':  to_float(xml_val(b, 'DiscountPct')),
+        })
+    for b in xml_blocks(xml, 'DateDrivenTermsRet'):
+        terms.append({
+            'name':      clean(xml_val(b, 'Name')),
+            'type':      'DateDriven',
+            'net_days':  int(xml_val(b, 'NetDays') or '0'),
+            'disc_days': 0,
+            'disc_pct':  to_float(xml_val(b, 'DiscountPct')),
+        })
+    print(f"    {len(terms)} terms found")
+    return terms
+
+
+def extract_ship_methods(session):
+    """Pull ship methods. Invoices and SOs reference ShipMethodRef and silently
+    fail on push if the method doesn't exist on the destination."""
+    print("  Extracting ship methods...")
+    request = '<ShipMethodQueryRq requestID="101"><ActiveStatus>All</ActiveStatus></ShipMethodQueryRq>'
+    xml = session._send(request)
+    out = []
+    for b in xml_blocks(xml, 'ShipMethodRet'):
+        out.append({
+            'list_id': clean(xml_val(b, 'ListID')),
+            'name':    clean(xml_val(b, 'Name')),
+            'active':  xml_val(b, 'IsActive') == 'true',
+        })
+    print(f"    {len(out)} ship methods found")
+    return out
+
+
+def extract_payment_methods(session):
+    """Pull payment methods. ReceivePayment / BillPaymentCheck reference these."""
+    print("  Extracting payment methods...")
+    request = '<PaymentMethodQueryRq requestID="102"><ActiveStatus>All</ActiveStatus></PaymentMethodQueryRq>'
+    xml = session._send(request)
+    out = []
+    for b in xml_blocks(xml, 'PaymentMethodRet'):
+        out.append({
+            'list_id':      clean(xml_val(b, 'ListID')),
+            'name':         clean(xml_val(b, 'Name')),
+            'payment_type': clean(xml_val(b, 'PaymentMethodType')),
+            'active':       xml_val(b, 'IsActive') == 'true',
+        })
+    print(f"    {len(out)} payment methods found")
+    return out
+
+
+def extract_sales_tax_codes(session):
+    """Pull sales tax codes (per-line on invoices/CMs to mark taxable vs not)."""
+    print("  Extracting sales tax codes...")
+    request = '<SalesTaxCodeQueryRq requestID="200"><ActiveStatus>All</ActiveStatus></SalesTaxCodeQueryRq>'
+    xml = session._send(request)
+    out = []
+    for b in xml_blocks(xml, 'SalesTaxCodeRet'):
+        out.append({
+            'list_id':     clean(xml_val(b, 'ListID')),
+            'name':        clean(xml_val(b, 'Name')),
+            'description': clean(xml_val(b, 'Desc')),
+            'is_taxable':  xml_val(b, 'IsTaxable') == 'true',
+            'active':      xml_val(b, 'IsActive') == 'true',
+        })
+    print(f"    {len(out)} sales tax codes found")
+    return out
+
+
+def extract_sales_tax_items(session):
+    """Pull sales tax items (per-jurisdiction tax rate items, e.g. NY/NJ Sales Tax)."""
+    print("  Extracting sales tax items...")
+    request = '<ItemSalesTaxQueryRq requestID="201"><ActiveStatus>All</ActiveStatus></ItemSalesTaxQueryRq>'
+    xml = session._send(request)
+    out = []
+    for b in xml_blocks(xml, 'ItemSalesTaxRet'):
+        out.append({
+            'list_id':     clean(xml_val(b, 'ListID')),
+            'name':        clean(xml_val(b, 'Name')),
+            'description': clean(xml_val(b, 'ItemDesc')),
+            'tax_rate':    to_float(xml_val(b, 'TaxRate')),
+            'tax_vendor':  clean(xml_ref(b, 'TaxVendorRef', 'FullName')),
+            'active':      xml_val(b, 'IsActive') == 'true',
+        })
+    print(f"    {len(out)} sales tax items found")
+    return out
+
+
+# ============================================================================
+# EXTRACTORS — TRANSACTIONS
+# ============================================================================
+
 def _parse_invoice_blocks(blocks):
     """Parse InvoiceRet XML blocks into dicts."""
     invoices = []
     for b in blocks:
         lines = []
         line_num = 1
-        line_blocks = xml_blocks(b, 'InvoiceLineRet')
-        for lb in line_blocks:
+        for lb in xml_blocks(b, 'InvoiceLineRet'):
             lines.append({
-                'line_no':     line_num,
-                'item':        clean(xml_ref(lb, 'ItemRef', 'FullName')),
-                'item_list_id':clean(xml_ref(lb, 'ItemRef', 'ListID')),
-                'description': clean(xml_val(lb, 'Desc')),
-                'qty':         to_float(xml_val(lb, 'Quantity')),
-                'unitms':      clean(xml_val(lb, 'UnitOfMeasure')),
-                'price':       to_float(xml_val(lb, 'Rate')),
-                'ext_price':   to_float(xml_val(lb, 'Amount')),
-                'tax_code':    clean(xml_ref(lb, 'SalesTaxCodeRef', 'FullName')),
+                'line_no':      line_num,
+                'item':         clean(xml_ref(lb, 'ItemRef', 'FullName')),
+                'item_list_id': clean(xml_ref(lb, 'ItemRef', 'ListID')),
+                'description':  clean(xml_val(lb, 'Desc')),
+                'qty':          to_float(xml_val(lb, 'Quantity')),
+                'unitms':       clean(xml_val(lb, 'UnitOfMeasure')),
+                'price':        to_float(xml_val(lb, 'Rate')),
+                'ext_price':    to_float(xml_val(lb, 'Amount')),
+                'tax_code':     clean(xml_ref(lb, 'SalesTaxCodeRef', 'FullName')),
             })
             line_num += 1
 
@@ -553,6 +849,8 @@ def _parse_invoice_blocks(blocks):
             'ship_via':     clean(xml_ref(b, 'ShipMethodRef', 'FullName')),
             'inv_amt':      to_float(xml_val(b, 'Subtotal')),
             'tax_amt':      to_float(xml_val(b, 'SalesTaxTotal')),
+            'tax_item':     clean(xml_ref(b, 'ItemSalesTaxRef', 'FullName')),
+            'tax_code':     clean(xml_ref(b, 'CustomerSalesTaxCodeRef', 'FullName')),
             'total_amt':    to_float(xml_val(b, 'TotalAmount')),
             'balance':      to_float(xml_val(b, 'BalanceRemaining')),
             'memo':         clean(xml_val(b, 'Memo')),
@@ -562,135 +860,57 @@ def _parse_invoice_blocks(blocks):
     return invoices
 
 
-def extract_invoices(session, years_back=3):
-    """Pull invoice headers and lines, chunked by year to avoid QB timeouts."""
-    if years_back == 0:
+def extract_invoices(session, years_back=3, date_range=None):
+    """Pull invoice headers and lines. Chunked by year unless date_range given."""
+    if date_range is not None:
+        print(f"  Extracting invoices ({date_range[0] or '...'} to {date_range[1] or '...'})...")
+    elif years_back == 0:
         print("  Extracting invoices (all history, chunked by year)...")
     else:
         print(f"  Extracting invoices (last {years_back} years)...")
 
-    # Build list of (from_date, to_date) chunks
-    today = datetime.date.today()
-    if years_back == 0:
-        # Go back 30 years in 1-year chunks — covers any realistic QB history
-        max_years = 30
-    else:
-        max_years = years_back
-
-    chunks = []
-    for i in range(max_years):
-        chunk_end   = today - datetime.timedelta(days=365 * i)
-        chunk_start = today - datetime.timedelta(days=365 * (i + 1))
-        chunks.append((chunk_start.strftime('%Y-%m-%d'), chunk_end.strftime('%Y-%m-%d')))
-
+    chunks = _build_date_chunks(years_back, date_range)
     all_invoices = []
     for from_date, to_date in chunks:
         request = f"""
     <InvoiceQueryRq requestID="7">
-      <TxnDateRangeFilter>
-        <FromTxnDate>{from_date}</FromTxnDate>
-        <ToTxnDate>{to_date}</ToTxnDate>
-      </TxnDateRangeFilter>
+{_txn_date_filter(from_date, to_date)}
       <IncludeLineItems>true</IncludeLineItems>
       <OwnerID>0</OwnerID>
     </InvoiceQueryRq>
     """
         try:
             xml = session._send(request)
-            blocks = xml_blocks(xml, 'InvoiceRet')
-            if blocks:
-                batch = _parse_invoice_blocks(blocks)
+            batch = _parse_invoice_blocks(xml_blocks(xml, 'InvoiceRet'))
+            if batch:
                 all_invoices.extend(batch)
                 print(f"    {from_date} to {to_date}: {len(batch)} invoices")
         except Exception as e:
             err = str(e)
             if 'timeout' in err.lower():
-                print(f"    {from_date} to {to_date}: TIMEOUT — skipping chunk")
+                print(f"    {from_date} to {to_date}: TIMEOUT -- skipping chunk")
             else:
-                print(f"    {from_date} to {to_date}: ERROR — {err[:100]}")
+                print(f"    {from_date} to {to_date}: ERROR -- {err[:100]}")
 
     print(f"    {len(all_invoices)} invoices found total")
     return all_invoices
 
 
-def extract_sales_reps(session):
-    """Pull sales rep list."""
-    print("  Extracting sales reps...")
-    request = """
-    <SalesRepQueryRq requestID="8">
-      <ActiveStatus>All</ActiveStatus>
-    </SalesRepQueryRq>
-    """
-    xml = session._send(request)
-    blocks = xml_blocks(xml, 'SalesRepRet')
-    reps = []
-    for b in blocks:
-        reps.append({
-            'initial':   clean(xml_val(b, 'Initial')),
-            'name':      clean(xml_ref(b, 'SalesRepEntityRef', 'FullName')),
-            'active':    xml_val(b, 'IsActive') == 'true',
-        })
-    print(f"    {len(reps)} sales reps found")
-    return reps
-
-
-def extract_terms(session):
-    """Pull payment terms."""
-    print("  Extracting payment terms...")
-    request = """
-    <TermsQueryRq requestID="9">
-      <ActiveStatus>All</ActiveStatus>
-    </TermsQueryRq>
-    """
-    xml = session._send(request)
-    # Standard terms
-    std_blocks  = xml_blocks(xml, 'StandardTermsRet')
-    date_blocks = xml_blocks(xml, 'DateDrivenTermsRet')
-    terms = []
-    for b in std_blocks:
-        terms.append({
-            'name':       clean(xml_val(b, 'Name')),
-            'type':       'Standard',
-            'net_days':   int(xml_val(b, 'NetDays') or '0'),
-            'disc_days':  int(xml_val(b, 'DiscountDays') or '0'),
-            'disc_pct':   to_float(xml_val(b, 'DiscountPct')),
-        })
-    for b in date_blocks:
-        terms.append({
-            'name':       clean(xml_val(b, 'Name')),
-            'type':       'DateDriven',
-            'net_days':   int(xml_val(b, 'NetDays') or '0'),
-            'disc_days':  0,
-            'disc_pct':   to_float(xml_val(b, 'DiscountPct')),
-        })
-    print(f"    {len(terms)} terms found")
-    return terms
-
-
-def extract_payments(session, years_back=3):
-    """Pull received payments, chunked by year like invoices."""
-    if years_back == 0:
+def extract_payments(session, years_back=3, date_range=None):
+    """Pull received customer payments."""
+    if date_range is not None:
+        print(f"  Extracting payments ({date_range[0] or '...'} to {date_range[1] or '...'})...")
+    elif years_back == 0:
         print("  Extracting payments (all history, chunked by year)...")
     else:
         print(f"  Extracting payments (last {years_back} years)...")
 
-    today = datetime.date.today()
-    max_years = 30 if years_back == 0 else years_back
-
-    chunks = []
-    for i in range(max_years):
-        chunk_end   = today - datetime.timedelta(days=365 * i)
-        chunk_start = today - datetime.timedelta(days=365 * (i + 1))
-        chunks.append((chunk_start.strftime('%Y-%m-%d'), chunk_end.strftime('%Y-%m-%d')))
-
+    chunks = _build_date_chunks(years_back, date_range)
     all_payments = []
     for from_date, to_date in chunks:
         request = f"""
     <ReceivePaymentQueryRq requestID="20">
-      <TxnDateRangeFilter>
-        <FromTxnDate>{from_date}</FromTxnDate>
-        <ToTxnDate>{to_date}</ToTxnDate>
-      </TxnDateRangeFilter>
+{_txn_date_filter(from_date, to_date)}
       <IncludeLineItems>true</IncludeLineItems>
       <OwnerID>0</OwnerID>
     </ReceivePaymentQueryRq>
@@ -699,7 +919,6 @@ def extract_payments(session, years_back=3):
             xml = session._send(request)
             blocks = xml_blocks(xml, 'ReceivePaymentRet')
             for b in blocks:
-                # Each payment can apply to multiple invoices
                 applied = []
                 for ab in xml_blocks(b, 'AppliedToTxnRet'):
                     applied.append({
@@ -708,7 +927,6 @@ def extract_payments(session, years_back=3):
                         'amount':   to_float(xml_val(ab, 'Amount')),
                         'disc_amt': to_float(xml_val(ab, 'DiscountAmount')),
                     })
-
                 all_payments.append({
                     'txn_id':       clean(xml_val(b, 'TxnID')),
                     'ref_no':       clean(xml_val(b, 'RefNumber')),
@@ -723,40 +941,29 @@ def extract_payments(session, years_back=3):
             if blocks:
                 print(f"    {from_date} to {to_date}: {len(blocks)} payments")
         except Exception as e:
-            err = str(e)
-            if 'timeout' in err.lower():
-                print(f"    {from_date} to {to_date}: TIMEOUT -- skipping")
-            else:
-                print(f"    {from_date} to {to_date}: ERROR -- {err[:100]}")
+            print(f"    {from_date} to {to_date}: ERROR -- {str(e)[:100]}")
 
     print(f"    {len(all_payments)} payments found total")
     return all_payments
 
 
-def extract_credit_memos(session, years_back=3):
-    """Pull credit memos, chunked by year."""
-    if years_back == 0:
+def extract_credit_memos(session, years_back=3, date_range=None):
+    """Pull credit memos. Tax fields (subtotal, sales_tax_total, tax_item,
+    tax_code, per-line tax_code) are critical — without them the push side
+    can't reconstruct sales tax and the totals come out wrong."""
+    if date_range is not None:
+        print(f"  Extracting credit memos ({date_range[0] or '...'} to {date_range[1] or '...'})...")
+    elif years_back == 0:
         print("  Extracting credit memos (all history, chunked by year)...")
     else:
         print(f"  Extracting credit memos (last {years_back} years)...")
 
-    today = datetime.date.today()
-    max_years = 30 if years_back == 0 else years_back
-
-    chunks = []
-    for i in range(max_years):
-        chunk_end   = today - datetime.timedelta(days=365 * i)
-        chunk_start = today - datetime.timedelta(days=365 * (i + 1))
-        chunks.append((chunk_start.strftime('%Y-%m-%d'), chunk_end.strftime('%Y-%m-%d')))
-
+    chunks = _build_date_chunks(years_back, date_range)
     all_memos = []
     for from_date, to_date in chunks:
         request = f"""
     <CreditMemoQueryRq requestID="21">
-      <TxnDateRangeFilter>
-        <FromTxnDate>{from_date}</FromTxnDate>
-        <ToTxnDate>{to_date}</ToTxnDate>
-      </TxnDateRangeFilter>
+{_txn_date_filter(from_date, to_date)}
       <IncludeLineItems>true</IncludeLineItems>
       <OwnerID>0</OwnerID>
     </CreditMemoQueryRq>
@@ -769,45 +976,52 @@ def extract_credit_memos(session, years_back=3):
                 line_num = 1
                 for lb in xml_blocks(b, 'CreditMemoLineRet'):
                     lines.append({
-                        'line_no':     line_num,
-                        'item':        clean(xml_ref(lb, 'ItemRef', 'FullName')),
-                        'item_list_id':clean(xml_ref(lb, 'ItemRef', 'ListID')),
-                        'description': clean(xml_val(lb, 'Desc')),
-                        'qty':         to_float(xml_val(lb, 'Quantity')),
-                        'price':       to_float(xml_val(lb, 'Rate')),
-                        'ext_price':   to_float(xml_val(lb, 'Amount')),
+                        'line_no':      line_num,
+                        'item':         clean(xml_ref(lb, 'ItemRef', 'FullName')),
+                        'item_list_id': clean(xml_ref(lb, 'ItemRef', 'ListID')),
+                        'description':  clean(xml_val(lb, 'Desc')),
+                        'qty':          to_float(xml_val(lb, 'Quantity')),
+                        'price':        to_float(xml_val(lb, 'Rate')),
+                        'ext_price':    to_float(xml_val(lb, 'Amount')),
+                        'tax_code':     clean(xml_ref(lb, 'SalesTaxCodeRef', 'FullName')),
                     })
                     line_num += 1
-
                 all_memos.append({
-                    'txn_id':       clean(xml_val(b, 'TxnID')),
-                    'ref_no':       clean(xml_val(b, 'RefNumber')),
-                    'date':         clean(xml_val(b, 'TxnDate')),
-                    'cust_name':    clean(xml_ref(b, 'CustomerRef', 'FullName')),
-                    'cust_list_id': clean(xml_ref(b, 'CustomerRef', 'ListID')),
-                    'total_amt':    to_float(xml_val(b, 'TotalAmount')),
-                    'balance':      to_float(xml_val(b, 'CreditRemaining')),
-                    'memo':         clean(xml_val(b, 'Memo')),
-                    'lines':        lines,
+                    'txn_id':          clean(xml_val(b, 'TxnID')),
+                    'ref_no':          clean(xml_val(b, 'RefNumber')),
+                    'date':            clean(xml_val(b, 'TxnDate')),
+                    'cust_name':       clean(xml_ref(b, 'CustomerRef', 'FullName')),
+                    'cust_list_id':    clean(xml_ref(b, 'CustomerRef', 'ListID')),
+                    'subtotal':        to_float(xml_val(b, 'Subtotal')),
+                    'sales_tax_total': to_float(xml_val(b, 'SalesTaxTotal')),
+                    'sales_tax_pct':   to_float(xml_val(b, 'SalesTaxPercentage')),
+                    'tax_item':        clean(xml_ref(b, 'ItemSalesTaxRef', 'FullName')),
+                    'tax_code':        clean(xml_ref(b, 'CustomerSalesTaxCodeRef', 'FullName')),
+                    'total_amt':       to_float(xml_val(b, 'TotalAmount')),
+                    'balance':         to_float(xml_val(b, 'CreditRemaining')),
+                    'memo':            clean(xml_val(b, 'Memo')),
+                    'lines':           lines,
                 })
             if blocks:
                 print(f"    {from_date} to {to_date}: {len(blocks)} credit memos")
         except Exception as e:
-            err = str(e)
-            if 'timeout' in err.lower():
-                print(f"    {from_date} to {to_date}: TIMEOUT -- skipping")
-            else:
-                print(f"    {from_date} to {to_date}: ERROR -- {err[:100]}")
+            print(f"    {from_date} to {to_date}: ERROR -- {str(e)[:100]}")
 
     print(f"    {len(all_memos)} credit memos found total")
     return all_memos
 
 
-def extract_sales_orders(session):
-    """Pull open/all sales orders."""
-    print("  Extracting sales orders...")
-    request = """
+def extract_sales_orders(session, date_range=None):
+    """Pull sales orders. Optional date_range filters by TxnDate."""
+    if date_range is not None:
+        print(f"  Extracting sales orders ({date_range[0] or '...'} to {date_range[1] or '...'})...")
+        filt = _txn_date_filter(date_range[0], date_range[1])
+    else:
+        print("  Extracting sales orders...")
+        filt = ''
+    request = f"""
     <SalesOrderQueryRq requestID="22">
+{filt}
       <IncludeLineItems>true</IncludeLineItems>
       <OwnerID>0</OwnerID>
     </SalesOrderQueryRq>
@@ -816,27 +1030,25 @@ def extract_sales_orders(session):
         xml = session._send(request)
     except Exception as e:
         if 'not enabled' in str(e).lower() or 'not supported' in str(e).lower():
-            print("    Sales Orders not available (QB Pro/Premier feature)")
+            print("    Sales Orders not available (QB Pro feature)")
             return []
         raise
-    blocks = xml_blocks(xml, 'SalesOrderRet')
     orders = []
-    for b in blocks:
+    for b in xml_blocks(xml, 'SalesOrderRet'):
         lines = []
         line_num = 1
         for lb in xml_blocks(b, 'SalesOrderLineRet'):
             lines.append({
-                'line_no':     line_num,
-                'item':        clean(xml_ref(lb, 'ItemRef', 'FullName')),
-                'item_list_id':clean(xml_ref(lb, 'ItemRef', 'ListID')),
-                'description': clean(xml_val(lb, 'Desc')),
-                'qty':         to_float(xml_val(lb, 'Quantity')),
-                'price':       to_float(xml_val(lb, 'Rate')),
-                'ext_price':   to_float(xml_val(lb, 'Amount')),
-                'qty_invoiced':to_float(xml_val(lb, 'Invoiced')),
+                'line_no':      line_num,
+                'item':         clean(xml_ref(lb, 'ItemRef', 'FullName')),
+                'item_list_id': clean(xml_ref(lb, 'ItemRef', 'ListID')),
+                'description':  clean(xml_val(lb, 'Desc')),
+                'qty':          to_float(xml_val(lb, 'Quantity')),
+                'price':        to_float(xml_val(lb, 'Rate')),
+                'ext_price':    to_float(xml_val(lb, 'Amount')),
+                'qty_invoiced': to_float(xml_val(lb, 'Invoiced')),
             })
             line_num += 1
-
         orders.append({
             'txn_id':       clean(xml_val(b, 'TxnID')),
             'ref_no':       clean(xml_val(b, 'RefNumber')),
@@ -856,11 +1068,17 @@ def extract_sales_orders(session):
     return orders
 
 
-def extract_purchase_orders(session):
-    """Pull purchase orders."""
-    print("  Extracting purchase orders...")
-    request = """
+def extract_purchase_orders(session, date_range=None):
+    """Pull purchase orders. Optional date_range filters by TxnDate."""
+    if date_range is not None:
+        print(f"  Extracting purchase orders ({date_range[0] or '...'} to {date_range[1] or '...'})...")
+        filt = _txn_date_filter(date_range[0], date_range[1])
+    else:
+        print("  Extracting purchase orders...")
+        filt = ''
+    request = f"""
     <PurchaseOrderQueryRq requestID="23">
+{filt}
       <IncludeLineItems>true</IncludeLineItems>
       <OwnerID>0</OwnerID>
     </PurchaseOrderQueryRq>
@@ -872,64 +1090,55 @@ def extract_purchase_orders(session):
             print("    Purchase Orders not available")
             return []
         raise
-    blocks = xml_blocks(xml, 'PurchaseOrderRet')
     orders = []
-    for b in blocks:
+    for b in xml_blocks(xml, 'PurchaseOrderRet'):
         lines = []
         line_num = 1
         for lb in xml_blocks(b, 'PurchaseOrderLineRet'):
             lines.append({
-                'line_no':     line_num,
-                'item':        clean(xml_ref(lb, 'ItemRef', 'FullName')),
-                'item_list_id':clean(xml_ref(lb, 'ItemRef', 'ListID')),
-                'description': clean(xml_val(lb, 'Desc')),
-                'qty':         to_float(xml_val(lb, 'Quantity')),
-                'price':       to_float(xml_val(lb, 'Rate')),
-                'ext_price':   to_float(xml_val(lb, 'Amount')),
-                'qty_received':to_float(xml_val(lb, 'ReceivedQuantity')),
+                'line_no':      line_num,
+                'item':         clean(xml_ref(lb, 'ItemRef', 'FullName')),
+                'item_list_id': clean(xml_ref(lb, 'ItemRef', 'ListID')),
+                'description':  clean(xml_val(lb, 'Desc')),
+                'qty':          to_float(xml_val(lb, 'Quantity')),
+                'price':        to_float(xml_val(lb, 'Rate')),
+                'ext_price':    to_float(xml_val(lb, 'Amount')),
+                'qty_received': to_float(xml_val(lb, 'ReceivedQuantity')),
             })
             line_num += 1
-
         orders.append({
-            'txn_id':       clean(xml_val(b, 'TxnID')),
-            'ref_no':       clean(xml_val(b, 'RefNumber')),
-            'date':         clean(xml_val(b, 'TxnDate')),
-            'expected_date':clean(xml_val(b, 'ExpectedDate')),
-            'vend_name':    clean(xml_ref(b, 'VendorRef', 'FullName')),
-            'vend_list_id': clean(xml_ref(b, 'VendorRef', 'ListID')),
-            'total_amt':    to_float(xml_val(b, 'TotalAmount')),
-            'is_fully_rcvd':xml_val(b, 'IsFullyReceived') == 'true',
-            'memo':         clean(xml_val(b, 'Memo')),
-            'lines':        lines,
+            'txn_id':        clean(xml_val(b, 'TxnID')),
+            'ref_no':        clean(xml_val(b, 'RefNumber')),
+            'date':          clean(xml_val(b, 'TxnDate')),
+            'expected_date': clean(xml_val(b, 'ExpectedDate')),
+            'vend_name':     clean(xml_ref(b, 'VendorRef', 'FullName')),
+            'vend_list_id':  clean(xml_ref(b, 'VendorRef', 'ListID')),
+            'total_amt':     to_float(xml_val(b, 'TotalAmount')),
+            'is_fully_rcvd': xml_val(b, 'IsFullyReceived') == 'true',
+            'memo':          clean(xml_val(b, 'Memo')),
+            'lines':         lines,
         })
     print(f"    {len(orders)} purchase orders found")
     return orders
 
 
-def extract_bills(session, years_back=3):
-    """Pull vendor bills (AP), chunked by year."""
-    if years_back == 0:
+def extract_bills(session, years_back=3, date_range=None):
+    """Pull vendor bills (AP). Each line gets `line_type` = 'expense' or 'item'
+    so the push side can pick ExpenseLineAdd vs ItemLineAdd (different schemas).
+    A bill can mix both line types in the same transaction."""
+    if date_range is not None:
+        print(f"  Extracting vendor bills ({date_range[0] or '...'} to {date_range[1] or '...'})...")
+    elif years_back == 0:
         print("  Extracting vendor bills (all history, chunked by year)...")
     else:
         print(f"  Extracting vendor bills (last {years_back} years)...")
 
-    today = datetime.date.today()
-    max_years = 30 if years_back == 0 else years_back
-
-    chunks = []
-    for i in range(max_years):
-        chunk_end   = today - datetime.timedelta(days=365 * i)
-        chunk_start = today - datetime.timedelta(days=365 * (i + 1))
-        chunks.append((chunk_start.strftime('%Y-%m-%d'), chunk_end.strftime('%Y-%m-%d')))
-
+    chunks = _build_date_chunks(years_back, date_range)
     all_bills = []
     for from_date, to_date in chunks:
         request = f"""
     <BillQueryRq requestID="24">
-      <TxnDateRangeFilter>
-        <FromTxnDate>{from_date}</FromTxnDate>
-        <ToTxnDate>{to_date}</ToTxnDate>
-      </TxnDateRangeFilter>
+{_txn_date_filter(from_date, to_date)}
       <IncludeLineItems>true</IncludeLineItems>
       <OwnerID>0</OwnerID>
     </BillQueryRq>
@@ -940,25 +1149,27 @@ def extract_bills(session, years_back=3):
             for b in blocks:
                 lines = []
                 line_num = 1
-                # Expense lines
+                # Expense lines: gl_code is an Account FullName
                 for lb in xml_blocks(b, 'ExpenseLineRet'):
                     lines.append({
                         'line_no':     line_num,
+                        'line_type':   'expense',
                         'description': clean(xml_val(lb, 'Memo')),
                         'amount':      to_float(xml_val(lb, 'Amount')),
                         'gl_code':     clean(xml_ref(lb, 'AccountRef', 'FullName')),
                     })
                     line_num += 1
-                # Item lines
+                # Item lines: gl_code is an Item FullName (NOT an account!)
                 for lb in xml_blocks(b, 'ItemLineRet'):
                     lines.append({
                         'line_no':     line_num,
+                        'line_type':   'item',
                         'description': clean(xml_val(lb, 'Desc')),
                         'amount':      to_float(xml_val(lb, 'Amount')),
+                        'qty':         to_float(xml_val(lb, 'Quantity')),
                         'gl_code':     clean(xml_ref(lb, 'ItemRef', 'FullName')),
                     })
                     line_num += 1
-
                 all_bills.append({
                     'txn_id':       clean(xml_val(b, 'TxnID')),
                     'ref_no':       clean(xml_val(b, 'RefNumber')),
@@ -976,40 +1187,27 @@ def extract_bills(session, years_back=3):
             if blocks:
                 print(f"    {from_date} to {to_date}: {len(blocks)} bills")
         except Exception as e:
-            err = str(e)
-            if 'timeout' in err.lower():
-                print(f"    {from_date} to {to_date}: TIMEOUT -- skipping")
-            else:
-                print(f"    {from_date} to {to_date}: ERROR -- {err[:100]}")
+            print(f"    {from_date} to {to_date}: ERROR -- {str(e)[:100]}")
 
     print(f"    {len(all_bills)} vendor bills found total")
     return all_bills
 
 
-def extract_bill_payments(session, years_back=3):
-    """Pull bill payment checks, chunked by year."""
-    if years_back == 0:
+def extract_bill_payments(session, years_back=3, date_range=None):
+    """Pull bill payment checks."""
+    if date_range is not None:
+        print(f"  Extracting bill payments ({date_range[0] or '...'} to {date_range[1] or '...'})...")
+    elif years_back == 0:
         print("  Extracting bill payments (all history, chunked by year)...")
     else:
         print(f"  Extracting bill payments (last {years_back} years)...")
 
-    today = datetime.date.today()
-    max_years = 30 if years_back == 0 else years_back
-
-    chunks = []
-    for i in range(max_years):
-        chunk_end   = today - datetime.timedelta(days=365 * i)
-        chunk_start = today - datetime.timedelta(days=365 * (i + 1))
-        chunks.append((chunk_start.strftime('%Y-%m-%d'), chunk_end.strftime('%Y-%m-%d')))
-
+    chunks = _build_date_chunks(years_back, date_range)
     all_payments = []
     for from_date, to_date in chunks:
         request = f"""
     <BillPaymentCheckQueryRq requestID="25">
-      <TxnDateRangeFilter>
-        <FromTxnDate>{from_date}</FromTxnDate>
-        <ToTxnDate>{to_date}</ToTxnDate>
-      </TxnDateRangeFilter>
+{_txn_date_filter(from_date, to_date)}
       <IncludeLineItems>true</IncludeLineItems>
       <OwnerID>0</OwnerID>
     </BillPaymentCheckQueryRq>
@@ -1021,10 +1219,9 @@ def extract_bill_payments(session, years_back=3):
                 applied = []
                 for ab in xml_blocks(b, 'AppliedToTxnRet'):
                     applied.append({
-                        'ref_no':  clean(xml_val(ab, 'RefNumber')),
-                        'amount':  to_float(xml_val(ab, 'Amount')),
+                        'ref_no': clean(xml_val(ab, 'RefNumber')),
+                        'amount': to_float(xml_val(ab, 'Amount')),
                     })
-
                 all_payments.append({
                     'txn_id':       clean(xml_val(b, 'TxnID')),
                     'ref_no':       clean(xml_val(b, 'RefNumber')),
@@ -1037,29 +1234,19 @@ def extract_bill_payments(session, years_back=3):
             if blocks:
                 print(f"    {from_date} to {to_date}: {len(blocks)} bill payments")
         except Exception as e:
-            err = str(e)
-            if 'timeout' in err.lower():
-                print(f"    {from_date} to {to_date}: TIMEOUT -- skipping")
-            else:
-                print(f"    {from_date} to {to_date}: ERROR -- {err[:100]}")
+            print(f"    {from_date} to {to_date}: ERROR -- {str(e)[:100]}")
 
     print(f"    {len(all_payments)} bill payments found total")
     return all_payments
 
 
 def extract_open_ar(session):
-    """Pull open AR balances (unpaid invoices)."""
+    """Pull open AR balances (unpaid invoices) — snapshot as of now."""
     print("  Extracting open AR balances...")
-    request = """
-    <InvoiceQueryRq requestID="10">
-      <PaidStatus>NotPaidOnly</PaidStatus>
-      <OwnerID>0</OwnerID>
-    </InvoiceQueryRq>
-    """
+    request = '<InvoiceQueryRq requestID="10"><PaidStatus>NotPaidOnly</PaidStatus><OwnerID>0</OwnerID></InvoiceQueryRq>'
     xml = session._send(request)
-    blocks = xml_blocks(xml, 'InvoiceRet')
     ar = []
-    for b in blocks:
+    for b in xml_blocks(xml, 'InvoiceRet'):
         bal = to_float(xml_val(b, 'BalanceRemaining'))
         if bal != 0:
             ar.append({
@@ -1076,28 +1263,70 @@ def extract_open_ar(session):
 
 
 # ============================================================================
-# MAIN
+# CLI / MAIN
 # ============================================================================
 
+def parse_args():
+    """CLI args. All optional — falls back to interactive prompt for years
+    when nothing is passed, so the EXE-double-click workflow still works."""
+    p = argparse.ArgumentParser(
+        description="Extract QuickBooks Desktop data to a single JSON bundle.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Examples:
+  QBExtract.py                                  # interactive
+  QBExtract.py --years 3                        # last 3 years of transactions
+  QBExtract.py --years 0                        # all history
+  QBExtract.py --year 2024                      # only 2024
+  QBExtract.py --from-date 2024-01-01 --to-date 2024-06-30
+  QBExtract.py --corrupt-safe --years 0         # full history, corrupt file
+""")
+    p.add_argument('--years', type=int, default=None,
+                   help='Years of transaction history (0=all, default=3 if interactive declines).')
+    p.add_argument('--year', type=int, default=None,
+                   help='Single year (e.g., 2024). Implies date range 2024-01-01..2024-12-31.')
+    p.add_argument('--from-date', dest='from_date', default=None,
+                   help='Transaction range start (YYYY-MM-DD). Overrides --years.')
+    p.add_argument('--to-date', dest='to_date', default=None,
+                   help='Transaction range end (YYYY-MM-DD). Overrides --years.')
+    p.add_argument('--corrupt-safe', action='store_true',
+                   help='Narrow master queries to non-history fields. Use for corrupt source files.')
+    p.add_argument('--output', default=None,
+                   help='Output JSON path. Default: <Company>_export_<YYYYMMDD>.json in cwd.')
+    return p.parse_args()
+
+
 def main():
+    args = parse_args()
+
     print("=" * 60)
-    print("QBExtract — QuickBooks Data Extractor")
+    print("QBExtract — QuickBooks Data Extractor (v2)")
     print("=" * 60)
-    print()
-    print("Make sure QuickBooks is OPEN with your company file loaded.")
     print()
 
-    # How many years of invoice history to pull
-    print("How many years of invoice history to export?")
-    print("  1 = last 1 year (fastest)")
-    print("  3 = last 3 years (recommended for demo)")
-    print("  0 = all history (may be slow for large files)")
-    try:
-        years = int(input("Years [3]: ").strip() or "3")
-    except ValueError:
-        years = 3
-    if years <= 0:
-        years = 0  # no date filter — all history
+    # Resolve date range vs years
+    date_range = None
+    if args.from_date or args.to_date:
+        date_range = (args.from_date, args.to_date)
+        years = 0  # ignored when date_range set
+    elif args.year:
+        date_range = (f'{args.year}-01-01', f'{args.year}-12-31')
+        years = 0
+    elif args.years is not None:
+        years = args.years
+    else:
+        print("Make sure QuickBooks is OPEN with your company file loaded.")
+        print()
+        print("How many years of transaction history to export?")
+        print("  1 = last 1 year (fastest)")
+        print("  3 = last 3 years (recommended for demo)")
+        print("  0 = all history (may be slow for large files)")
+        try:
+            years = int(input("Years [3]: ").strip() or "3")
+        except ValueError:
+            years = 3
+        if years < 0:
+            years = 0
 
     print()
     print("Connecting to QuickBooks...")
@@ -1110,26 +1339,36 @@ def main():
         print()
 
         bundle['meta'] = {
-            'company':      session.company_name,
-            'exported_at':  datetime.datetime.now().isoformat(),
-            'years_back':   years,
-            'extractor':    'QBExtract v1.0',
+            'company':       session.company_name,
+            'exported_at':   datetime.datetime.now().isoformat(),
+            'years_back':    years,
+            'date_range':    date_range,
+            'corrupt_safe':  args.corrupt_safe,
+            'extractor':     'QBExtract v2.0',
         }
 
-        bundle['customers']          = extract_customers(session)
-        bundle['items']              = extract_items(session)
+        # Masters first
+        bundle['accounts']           = extract_accounts(session)
+        bundle['terms']              = extract_terms(session)
+        bundle['ship_methods']       = extract_ship_methods(session)
+        bundle['payment_methods']    = extract_payment_methods(session)
+        bundle['sales_tax_codes']    = extract_sales_tax_codes(session)
+        bundle['sales_tax_items']    = extract_sales_tax_items(session)
+        bundle['sales_reps']         = extract_sales_reps(session)
         bundle['price_levels']       = extract_price_levels(session)
         bundle['quantity_discounts'] = extract_quantity_discounts(session)
         bundle['vendors']            = extract_vendors(session)
-        bundle['sales_reps']         = extract_sales_reps(session)
-        bundle['terms']              = extract_terms(session)
-        bundle['invoices']           = extract_invoices(session, years)
-        bundle['payments']           = extract_payments(session, years)
-        bundle['credit_memos']       = extract_credit_memos(session, years)
-        bundle['sales_orders']       = extract_sales_orders(session)
-        bundle['purchase_orders']    = extract_purchase_orders(session)
-        bundle['bills']              = extract_bills(session, years)
-        bundle['bill_payments']      = extract_bill_payments(session, years)
+        bundle['items']              = extract_items(session, corrupt_safe=args.corrupt_safe)
+        bundle['customers']          = extract_customers(session, corrupt_safe=args.corrupt_safe)
+
+        # Transactions
+        bundle['invoices']           = extract_invoices(session, years, date_range)
+        bundle['payments']           = extract_payments(session, years, date_range)
+        bundle['credit_memos']       = extract_credit_memos(session, years, date_range)
+        bundle['sales_orders']       = extract_sales_orders(session, date_range)
+        bundle['purchase_orders']    = extract_purchase_orders(session, date_range)
+        bundle['bills']              = extract_bills(session, years, date_range)
+        bundle['bill_payments']      = extract_bill_payments(session, years, date_range)
         bundle['open_ar']            = extract_open_ar(session)
 
     except Exception as e:
@@ -1145,14 +1384,18 @@ def main():
         session.disconnect()
 
     # Write output file
-    safe_name = ''.join(c if c.isalnum() or c in (' ', '-', '_') else '_'
-                        for c in session.company_name).strip()
-    date_str  = datetime.date.today().strftime('%Y%m%d')
-    filename  = f"{safe_name}_export_{date_str}.json"
-    filepath  = os.path.join(os.getcwd(), filename)
+    if args.output:
+        filepath = args.output
+        filename = os.path.basename(filepath)
+    else:
+        safe_name = ''.join(c if c.isalnum() or c in (' ', '-', '_') else '_'
+                            for c in session.company_name).strip()
+        date_str  = datetime.date.today().strftime('%Y%m%d')
+        filename  = f"{safe_name}_export_{date_str}.json"
+        filepath  = os.path.join(os.getcwd(), filename)
 
     print()
-    print(f"Writing output file...")
+    print("Writing output file...")
     with open(filepath, 'w', encoding='utf-8') as f:
         json.dump(bundle, f, indent=2, ensure_ascii=False)
 
@@ -1162,18 +1405,20 @@ def main():
     print("=" * 60)
     print("DONE")
     print("=" * 60)
-    print(f"  Company:        {session.company_name}")
-    print(f"  Customers:      {len(bundle['customers'])}")
-    print(f"  Items:          {len(bundle['items'])}")
-    print(f"  Invoices:       {len(bundle['invoices'])}")
-    print(f"  Payments:       {len(bundle.get('payments', []))}")
-    print(f"  Credit Memos:   {len(bundle.get('credit_memos', []))}")
-    print(f"  Sales Orders:   {len(bundle.get('sales_orders', []))}")
-    print(f"  Vendors:        {len(bundle['vendors'])}")
-    print(f"  Purchase Orders:{len(bundle.get('purchase_orders', []))}")
-    print(f"  Vendor Bills:   {len(bundle.get('bills', []))}")
-    print(f"  Bill Payments:  {len(bundle.get('bill_payments', []))}")
-    print(f"  File:           {filename}  ({size_mb:.1f} MB)")
+    print(f"  Company:           {session.company_name}")
+    print(f"  Accounts:          {len(bundle['accounts'])}")
+    print(f"  Customers:         {len(bundle['customers'])}")
+    print(f"  Items:             {len(bundle['items'])}")
+    print(f"  Vendors:           {len(bundle['vendors'])}")
+    print(f"  Invoices:          {len(bundle['invoices'])}")
+    print(f"  Payments:          {len(bundle['payments'])}")
+    print(f"  Credit Memos:      {len(bundle['credit_memos'])}")
+    print(f"  Sales Orders:      {len(bundle['sales_orders'])}")
+    print(f"  Purchase Orders:   {len(bundle['purchase_orders'])}")
+    print(f"  Vendor Bills:      {len(bundle['bills'])}")
+    print(f"  Bill Payments:     {len(bundle['bill_payments'])}")
+    print(f"  Open AR items:     {len(bundle['open_ar'])}")
+    print(f"  File:              {filename}  ({size_mb:.1f} MB)")
     print()
     print("Send this file to your ERP consultant for import.")
     print()
