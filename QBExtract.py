@@ -4,6 +4,20 @@ QBExtract.py — QuickBooks Desktop Data Extractor
 Reads data directly from a running QuickBooks Desktop/Enterprise company file
 via the QB SDK (QBXML) and produces a single JSON bundle for import.
 
+What's new in v3 (2026-07):
+  - **General Ledger** — the posting-line ledger, pulled via QuickBooks'
+    own report engine (`GeneralDetailReportQueryRq` / `GeneralLedger`) rather
+    than by re-deriving double-entry from raw transactions. QBD generates the
+    implicit balancing entries and, with `<ReportBasis>Cash</ReportBasis>`,
+    computes cash-basis itself. Runs once per basis (Accrual + Cash by default)
+    and tags every row with its basis. See `--gl-basis` / `--no-gl`. GL amounts
+    are stored as exact decimal STRINGS (never float) so they reconcile to the
+    penny downstream.
+  - **`--probe-gl`** — a structure probe for the GL report. Run it against the
+    real company file first: it dumps the raw report XML and reports which
+    columns come back and whether each line's internal TxnID is exposed (the
+    one version-dependent unknown that drill-down/attachment linking depends on).
+
 What's new in v2 (2026-05):
   - **ASCII normalization** of every text field. Real-world QB files have
     Windows-1252 smart punctuation, Latin-1 supplement chars, and stray
@@ -62,6 +76,7 @@ import subprocess
 import sys
 import tempfile
 import traceback
+from decimal import Decimal, InvalidOperation
 
 
 # ============================================================================
@@ -1263,6 +1278,504 @@ def extract_open_ar(session):
 
 
 # ============================================================================
+# GENERAL LEDGER — REPORT EXTRACTION (Option A: QBD report engine)
+# ============================================================================
+#
+# Unlike every other extractor in this file, the General Ledger does NOT come
+# back as a list of "<Foo>Ret" entity blocks. It is a *report* response:
+#
+#   <GeneralDetailReportQueryRs statusCode="0" ...>
+#     <ReportRet>
+#       <ReportTitle>General Ledger</ReportTitle>
+#       <ReportBasis>Accrual</ReportBasis>
+#       <ColDesc colID="1"><ColTitle titleRow="1" value="Type"/><ColType>TxnType</ColType></ColDesc>
+#       <ColDesc colID="2">...</ColDesc>
+#       ...
+#       <ReportData>
+#         <TextRow>...account-name section header...</TextRow>
+#         <DataRow>
+#           <RowData .../>                <!-- may carry the txn linkage/TxnID -->
+#           <ColData colID="1" value="Check"/>
+#           <ColData colID="2" value="2024-03-14"/>
+#           ...
+#         </DataRow>
+#         <SubtotalRow>...</SubtotalRow>  <!-- skipped: re-aggregated downstream -->
+#       </ReportData>
+#     </ReportRet>
+#   </GeneralDetailReportQueryRs>
+#
+# So the existing xml_blocks/xml_val entity helpers don't apply. We:
+#   1. read ColDesc to map colID -> canonical field (Date/TxnType/Num/Name/...)
+#   2. walk ReportData rows *in document order*, carrying the account from the
+#      most recent account section header onto each DataRow beneath it
+#   3. skip Subtotal/Total rows (downstream re-aggregates from raw amounts)
+#   4. parse money display strings ("1,234.56", "(1,234.56)") to Decimal
+#
+# The one version-dependent unknown is whether the report exposes each line's
+# internal TxnID. Run `--probe-gl` against the real company file FIRST; the
+# probe dumps the raw report XML and reports exactly which columns and row-level
+# IDs are present, so this parser can be trusted before it feeds drill-down.
+
+
+def _tag_attrs(tag_text):
+    """Parse XML attributes out of a start-tag/self-closing-tag body into a
+    dict. Given `colID="1" value="Check"` returns {'colID':'1','value':'Check'}."""
+    return dict(re.findall(r'(\w+)\s*=\s*"(.*?)"', tag_text, re.DOTALL))
+
+
+def _norm_key(s):
+    """Collapse a ColType/ColTitle to a lookup key: lowercase, alnum only, so
+    'Ref Number', 'RefNumber' and 'refNumber' all map to the same bucket."""
+    return re.sub(r'[^a-z0-9]', '', (s or '').lower())
+
+
+def parse_amount(s):
+    """Parse a QB report money/display string to Decimal. Handles thousands
+    separators, a leading currency symbol, and parenthesized OR signed
+    negatives. Returns None for blank/unparseable so callers can tell "no
+    value" apart from 0. NEVER uses float() — the GL must reconcile to the
+    penny, and binary float can't represent decimal cents exactly."""
+    if s is None:
+        return None
+    t = s.strip()
+    if not t:
+        return None
+    neg = False
+    if t.startswith('(') and t.endswith(')'):
+        neg = True
+        t = t[1:-1].strip()
+    t = t.replace(',', '').replace('$', '').replace(' ', '')
+    if t.startswith('-'):
+        neg, t = True, t[1:]
+    elif t.startswith('+'):
+        t = t[1:]
+    if not t:
+        return None
+    try:
+        d = Decimal(t)
+    except (InvalidOperation, ValueError):
+        return None
+    return -d if neg else d
+
+
+# Canonical GL field <- report ColType (preferred, more stable across versions)
+# or ColTitle (fallback). The probe prints both so these can be tuned to the
+# actual company file if a column comes back unmapped.
+_GL_FIELD_BY_COLTYPE = {
+    'txntype': 'txn_type',
+    'date': 'date',
+    'refnumber': 'ref_number',
+    'number': 'ref_number',
+    'name': 'name',
+    'memo': 'memo',
+    'splitaccount': 'split',
+    'split': 'split',
+    'account': 'split',
+    'amount': 'amount',
+    'runningbalance': 'running_balance',
+    'balance': 'running_balance',
+    'class': 'class_name',
+    'quantity': 'quantity',
+    'clr': 'cleared',
+}
+_GL_FIELD_BY_COLTITLE = {
+    'type': 'txn_type',
+    'date': 'date',
+    'num': 'ref_number',
+    'number': 'ref_number',
+    'name': 'name',
+    'memo': 'memo',
+    'split': 'split',
+    'amount': 'amount',
+    'balance': 'running_balance',
+    'class': 'class_name',
+    'qty': 'quantity',
+    'clr': 'cleared',
+}
+
+
+def _gl_field_for(coltype, coltitle):
+    """Resolve a column's canonical field name: ColType first, ColTitle as
+    fallback. Returns None for columns we don't carry (kept visible in probe)."""
+    return (_GL_FIELD_BY_COLTYPE.get(_norm_key(coltype))
+            or _GL_FIELD_BY_COLTITLE.get(_norm_key(coltitle)))
+
+
+_COLDATA_RE = re.compile(r'<ColData\b((?:"[^"]*"|[^>])*)/?>')
+_GL_ROW_RE = re.compile(r'<(TextRow|DataRow|SubtotalRow|TotalRow)\b(.*?)</\1>',
+                        re.DOTALL)
+
+
+def _parse_col_descs(report_xml):
+    """Return {colID(int) -> {'coltype','coltitle','field'}} from <ColDesc>
+    defs. ColType is an element; ColTitle is a self-closing tag with a `value`
+    attr, possibly repeated (one per header row) — the last non-empty wins."""
+    cols = {}
+    for cd in re.findall(r'<ColDesc\b(.*?)</ColDesc>', report_xml, re.DOTALL):
+        head = cd.split('>', 1)[0]
+        try:
+            col_id = int(_tag_attrs(head).get('colID', '0'))
+        except ValueError:
+            continue
+        coltype = xml_val(cd, 'ColType')
+        coltitle = ''
+        for t in re.findall(r'<ColTitle\b([^>]*?)/?>', cd):
+            v = _tag_attrs(t).get('value', '')
+            if v:
+                coltitle = v
+        cols[col_id] = {
+            'coltype':  coltype,
+            'coltitle': coltitle,
+            'field':    _gl_field_for(coltype, coltitle),
+        }
+    return cols
+
+
+def _parse_rowdata(row_body):
+    """Extract the row-level <RowData> of a report row: its rowType/value attrs
+    and any nested ListID/TxnID (the account or transaction linkage)."""
+    m = re.search(r'<RowData\b(.*?)(?:/>|>(.*?)</RowData>)', row_body, re.DOTALL)
+    if not m:
+        return {'rowType': '', 'value': '', 'list_id': '', 'txn_id': ''}
+    attrs = _tag_attrs(m.group(1))
+    inner = m.group(2) or ''
+    return {
+        'rowType': attrs.get('rowType', ''),
+        'value':   attrs.get('value', ''),
+        'list_id': xml_val(inner, 'ListID'),
+        'txn_id':  xml_val(inner, 'TxnID'),
+    }
+
+
+def _index_accounts(accounts):
+    """Index the extracted chart of accounts for GL enrichment: match a report's
+    account row back to the master by ListID (best), then FullName, then Name."""
+    idx = {'by_list_id': {}, 'by_full_name': {}, 'by_name': {}}
+    for a in accounts or []:
+        if a.get('list_id'):
+            idx['by_list_id'][a['list_id']] = a
+        if a.get('full_name'):
+            idx['by_full_name'].setdefault(a['full_name'], a)
+        if a.get('name'):
+            idx['by_name'].setdefault(a['name'], a)
+    return idx
+
+
+def parse_general_ledger_report(xml, basis, accounts_index=None):
+    """Parse one GeneralDetailReportQueryRs (General Ledger) into posting-line
+    dicts, tagged with `basis` ('Accrual'|'Cash').
+
+    Walks ReportData statefully: the account comes from the most recent section
+    header (TextRow, or a DataRow with rowType='account'), carried onto each
+    posting DataRow beneath it. Subtotal/Total rows are skipped — downstream
+    re-aggregates from raw amounts. `accounts_index` (from `_index_accounts`)
+    enriches account_full_name/account_type/list_id from the extracted master
+    instead of trusting the report's display text.
+
+    Returns (rows, status_code, status_message)."""
+    status_code, status_msg = '0', ''
+    m = re.search(r'<GeneralDetailReportQueryRs\b([^>]*)>', xml)
+    if m:
+        a = _tag_attrs(m.group(1))
+        status_code = a.get('statusCode', '0')
+        status_msg = a.get('statusMessage', '')
+    if status_code not in ('0', ''):
+        return [], status_code, status_msg
+
+    report_blocks = re.findall(r'<ReportRet\b.*?</ReportRet>', xml, re.DOTALL)
+    if not report_blocks:
+        return [], status_code, status_msg
+    report = report_blocks[0]
+    cols = _parse_col_descs(report)
+
+    dm = re.search(r'<ReportData\b.*?</ReportData>', report, re.DOTALL)
+    if not dm:
+        return [], status_code, status_msg
+    data = dm.group(0)
+
+    rows_out = []
+    cur_account = ''
+    cur_account_list_id = ''
+    for rm in _GL_ROW_RE.finditer(data):
+        row_type, body = rm.group(1), rm.group(2)
+        rd = _parse_rowdata(body)
+
+        if row_type in ('SubtotalRow', 'TotalRow'):
+            continue
+
+        if row_type == 'TextRow':
+            # Account section header. Some TextRows are blank spacers; adopt a
+            # new account only when the row actually names one.
+            label = clean(rd['value'])
+            if not label:
+                for c in _COLDATA_RE.findall(body):
+                    v = _tag_attrs(c).get('value', '')
+                    if v:
+                        label = clean(v)
+                        break
+            if label:
+                cur_account = label
+                cur_account_list_id = rd['list_id']
+            continue
+
+        # DataRow. Some GL layouts emit the account header as a DataRow with
+        # rowType='account' instead of a TextRow — treat that as a header too.
+        if rd['rowType'] in ('account', 'section'):
+            if rd['value']:
+                cur_account = clean(rd['value'])
+                cur_account_list_id = rd['list_id']
+            continue
+
+        colvals = {}
+        for c in _COLDATA_RE.findall(body):
+            a = _tag_attrs(c)
+            try:
+                cid = int(a.get('colID', '0'))
+            except ValueError:
+                continue
+            colvals[cid] = a.get('value', '')
+
+        rec = {
+            'txn_type': '', 'ref_number': '', 'date': '', 'name': '',
+            'memo': '', 'split': '', 'class_name': '', 'amount': '',
+            'running_balance': '',
+        }
+        for cid, meta in cols.items():
+            field = meta.get('field')
+            if not field or field not in rec or cid not in colvals:
+                continue
+            raw = colvals[cid]
+            if field in ('amount', 'running_balance'):
+                d = parse_amount(raw)
+                rec[field] = str(d) if d is not None else ''
+            else:
+                rec[field] = clean(raw)
+
+        # Skip blank spacer DataRows (no meaningful posting content).
+        if not any((rec['txn_type'], rec['ref_number'], rec['date'],
+                    rec['amount'], rec['name'], rec['memo'])):
+            continue
+
+        acct_name = cur_account
+        acct_type = ''
+        acct_list_id = cur_account_list_id
+        if accounts_index:
+            hit = None
+            if acct_list_id and acct_list_id in accounts_index['by_list_id']:
+                hit = accounts_index['by_list_id'][acct_list_id]
+            elif cur_account in accounts_index['by_full_name']:
+                hit = accounts_index['by_full_name'][cur_account]
+            elif cur_account in accounts_index['by_name']:
+                hit = accounts_index['by_name'][cur_account]
+            if hit:
+                acct_name = hit.get('full_name') or acct_name
+                acct_type = hit.get('account_type', '')
+                acct_list_id = hit.get('list_id') or acct_list_id
+
+        rows_out.append({
+            'txn_id':            clean(rd['txn_id']),
+            'txn_type':          rec['txn_type'],
+            'ref_number':        rec['ref_number'],
+            'date':              rec['date'],
+            'account_full_name': acct_name,
+            'account_list_id':   acct_list_id,
+            'account_type':      acct_type,
+            'name':              rec['name'],
+            'memo':              rec['memo'],
+            'split':             rec['split'],
+            'class':             rec['class_name'],
+            'amount':            rec['amount'],
+            'running_balance':   rec['running_balance'],
+            'basis':             basis,
+        })
+    return rows_out, status_code, status_msg
+
+
+def _add_months(d, n):
+    """First-of-month date `n` months after `d` (n may be negative)."""
+    m = d.month - 1 + n
+    return datetime.date(d.year + m // 12, m % 12 + 1, 1)
+
+
+def _build_report_period_chunks(years_back, date_range, granularity='month'):
+    """Calendar-aligned (from, to) windows for report ReportPeriods.
+
+    Unlike the rolling 365-day windows the entity txn queries use, GL report
+    chunks align to month/quarter boundaries: each maps cleanly to a
+    ReportPeriod and P&L reconciliation lands on real period boundaries. Chunk
+    failures stay isolated to one period."""
+    today = datetime.date.today()
+    if date_range is not None:
+        from_s, to_s = date_range
+        start = (datetime.datetime.strptime(from_s, '%Y-%m-%d').date()
+                 if from_s else datetime.date(today.year - 30, 1, 1))
+        end = (datetime.datetime.strptime(to_s, '%Y-%m-%d').date()
+               if to_s else today)
+    else:
+        yb = 30 if years_back == 0 else years_back
+        start = datetime.date(today.year - yb + 1, 1, 1)
+        end = today
+
+    step = 3 if granularity == 'quarter' else 1
+    if granularity == 'quarter':
+        start = datetime.date(start.year, ((start.month - 1) // 3) * 3 + 1, 1)
+    else:
+        start = datetime.date(start.year, start.month, 1)
+
+    windows = []
+    cur = start
+    while cur <= end:
+        nxt = _add_months(cur, step)
+        w_to = min(nxt - datetime.timedelta(days=1), end)
+        windows.append((cur.strftime('%Y-%m-%d'), w_to.strftime('%Y-%m-%d')))
+        cur = nxt
+    return windows
+
+
+def _gl_report_request(from_date, to_date, basis, request_id='300'):
+    """Build a GeneralDetailReportQueryRq for the General Ledger over a period.
+    Element order follows the qbXML v13 schema: type, period, basis."""
+    return f"""
+    <GeneralDetailReportQueryRq requestID="{request_id}">
+      <GeneralDetailReportType>GeneralLedger</GeneralDetailReportType>
+      <ReportPeriod>
+        <FromReportDate>{from_date}</FromReportDate>
+        <ToReportDate>{to_date}</ToReportDate>
+      </ReportPeriod>
+      <ReportBasis>{basis}</ReportBasis>
+    </GeneralDetailReportQueryRq>
+    """
+
+
+def extract_general_ledger(session, years_back=3, date_range=None,
+                           bases=('Accrual', 'Cash'), granularity='month',
+                           accounts=None):
+    """Extract the General Ledger via QBD's report engine (Option A).
+
+    Runs GeneralDetailReportQueryRq(GeneralLedger) once per basis per calendar
+    chunk and concatenates the posting lines. QBD generates the implicit
+    balancing entries and — for basis='Cash' — computes cash-basis itself,
+    which is otherwise the hardest part of P&L replication.
+
+    Returns a flat list of posting-line dicts (see parse_general_ledger_report),
+    each tagged with its `basis`. Chunk failures are isolated: one bad period is
+    logged and skipped rather than losing the whole ledger. Amounts are exact
+    decimal strings, not floats."""
+    accounts_index = _index_accounts(accounts) if accounts else None
+    chunks = _build_report_period_chunks(years_back, date_range, granularity)
+    all_rows = []
+    for basis in bases:
+        print(f"  Extracting general ledger "
+              f"[{basis} basis, {len(chunks)} {granularity} chunks]...")
+        basis_rows = 0
+        for from_date, to_date in chunks:
+            request = _gl_report_request(from_date, to_date, basis)
+            try:
+                xml = session._send(request)
+                rows, status_code, status_msg = parse_general_ledger_report(
+                    xml, basis, accounts_index)
+                if status_code not in ('0', ''):
+                    print(f"    {from_date} to {to_date} [{basis}]: "
+                          f"status {status_code} {status_msg[:80]}")
+                    continue
+                if rows:
+                    all_rows.extend(rows)
+                    basis_rows += len(rows)
+                    print(f"    {from_date} to {to_date} [{basis}]: "
+                          f"{len(rows)} lines")
+            except Exception as e:
+                print(f"    {from_date} to {to_date} [{basis}]: "
+                      f"ERROR -- {str(e)[:100]}")
+        print(f"    {basis_rows} {basis}-basis GL lines")
+    print(f"    {len(all_rows)} general ledger lines found total")
+    return all_rows
+
+
+def probe_gl_report(session, date_range=None):
+    """Diagnostic (handoff step 2): run ONE General Ledger report over a small
+    window, dump the raw response XML, and report its structure — especially
+    whether each posting line's internal TxnID is exposed. Run this against the
+    real company file BEFORE trusting the GL extractor for drill-down/attachment
+    linking. Writes <Company>_gl_probe_<YYYYMMDD>.xml and prints a summary."""
+    today = datetime.date.today()
+    if date_range is not None:
+        from_date, to_date = date_range
+        from_date = from_date or today.replace(day=1).strftime('%Y-%m-%d')
+        to_date = to_date or today.strftime('%Y-%m-%d')
+    else:
+        # Last full calendar month.
+        last_prev = today.replace(day=1) - datetime.timedelta(days=1)
+        from_date = last_prev.replace(day=1).strftime('%Y-%m-%d')
+        to_date = last_prev.strftime('%Y-%m-%d')
+
+    print("=" * 60)
+    print("GL REPORT PROBE")
+    print("=" * 60)
+    print(f"  Period: {from_date} to {to_date}  (Accrual basis)")
+    request = _gl_report_request(from_date, to_date, 'Accrual', request_id='399')
+    xml = session._send(request)
+
+    safe_name = ''.join(c if c.isalnum() or c in (' ', '-', '_') else '_'
+                        for c in (session.company_name or 'company')).strip()
+    dump = os.path.join(os.getcwd(),
+                        f"{safe_name}_gl_probe_{today.strftime('%Y%m%d')}.xml")
+    with open(dump, 'w', encoding='utf-8') as f:
+        f.write(xml)
+    print(f"  Raw response written to: {os.path.basename(dump)}  "
+          f"({len(xml)} bytes)")
+
+    m = re.search(r'<GeneralDetailReportQueryRs\b([^>]*)>', xml)
+    if m:
+        a = _tag_attrs(m.group(1))
+        print(f"  statusCode={a.get('statusCode', '?')} "
+              f"statusMessage={a.get('statusMessage', '')[:80]}")
+
+    report_blocks = re.findall(r'<ReportRet\b.*?</ReportRet>', xml, re.DOTALL)
+    if not report_blocks:
+        print("  No <ReportRet> in response — cannot probe columns.")
+        print("=" * 60)
+        return
+    report = report_blocks[0]
+
+    cols = _parse_col_descs(report)
+    print(f"\n  Columns ({len(cols)}):")
+    for cid in sorted(cols):
+        c = cols[cid]
+        print(f"    colID {cid}: ColType={c['coltype']!r} "
+              f"ColTitle={c['coltitle']!r} -> field={c['field']}")
+
+    dm = re.search(r'<ReportData\b.*?</ReportData>', report, re.DOTALL)
+    data = dm.group(0) if dm else ''
+    counts = {}
+    for rm in _GL_ROW_RE.finditer(data):
+        counts[rm.group(1)] = counts.get(rm.group(1), 0) + 1
+    print(f"\n  Row types: {counts}")
+
+    # TxnID presence — THE key question for drill-down.
+    data_rows = re.findall(r'<DataRow\b.*?</DataRow>', data, re.DOTALL)
+    with_txnid = sum(1 for r in data_rows if '<TxnID>' in r)
+    with_idlist = sum(1 for r in data_rows if '<IDList>' in r or '<ListID>' in r)
+    print(f"\n  DataRows: {len(data_rows)}")
+    print(f"    with <TxnID>: {with_txnid}   <-- drill-down/attachments need this")
+    print(f"    with <ListID>/<IDList>: {with_idlist}")
+    if with_txnid == 0:
+        print("    => Report does NOT expose TxnID. Plan for RefNumber-based")
+        print("       linking, or an Option-B txn join on Type+RefNumber+Date+Amount.")
+    else:
+        print("    => Report EXPOSES TxnID. Drill-down can link directly.")
+
+    if data_rows:
+        print("\n  Sample DataRow (raw, first 600 chars):")
+        print("    " + data_rows[0].strip()[:600])
+
+    parsed, _, _ = parse_general_ledger_report(xml, 'Accrual')
+    print(f"\n  Parser extracted {len(parsed)} posting lines. First 3:")
+    for r in parsed[:3]:
+        print(f"    {r}")
+    print("=" * 60)
+
+
+# ============================================================================
 # CLI / MAIN
 # ============================================================================
 
@@ -1280,6 +1793,9 @@ Examples:
   QBExtract.py --year 2024                      # only 2024
   QBExtract.py --from-date 2024-01-01 --to-date 2024-06-30
   QBExtract.py --corrupt-safe --years 0         # full history, corrupt file
+  QBExtract.py --probe-gl --year 2024           # probe GL report structure, exit
+  QBExtract.py --gl-basis accrual --years 3     # GL accrual only (default: both)
+  QBExtract.py --no-gl --years 3                # skip General Ledger
 """)
     p.add_argument('--years', type=int, default=None,
                    help='Years of transaction history (0=all, default=3 if interactive declines).')
@@ -1291,6 +1807,19 @@ Examples:
                    help='Transaction range end (YYYY-MM-DD). Overrides --years.')
     p.add_argument('--corrupt-safe', action='store_true',
                    help='Narrow master queries to non-history fields. Use for corrupt source files.')
+    p.add_argument('--gl-basis', dest='gl_basis',
+                   choices=['accrual', 'cash', 'both'], default='both',
+                   help='General Ledger report basis to extract (default: both). '
+                        'Cash basis is computed by QBD itself.')
+    p.add_argument('--gl-granularity', dest='gl_granularity',
+                   choices=['month', 'quarter'], default='month',
+                   help='Calendar chunk size for GL report queries (default: month). '
+                        'Smaller chunks isolate failures to a shorter period.')
+    p.add_argument('--no-gl', dest='no_gl', action='store_true',
+                   help='Skip General Ledger extraction.')
+    p.add_argument('--probe-gl', dest='probe_gl', action='store_true',
+                   help='Run the GL report structure probe (TxnID check) and exit. '
+                        'Run this against the real company file FIRST.')
     p.add_argument('--output', default=None,
                    help='Output JSON path. Default: <Company>_export_<YYYYMMDD>.json in cwd.')
     return p.parse_args()
@@ -1338,13 +1867,22 @@ def main():
         session.connect()
         print()
 
+        # GL structure probe: run against the real company file first to answer
+        # the TxnID question, then exit without writing the full bundle.
+        if args.probe_gl:
+            probe_gl_report(session, date_range)
+            return
+
         bundle['meta'] = {
-            'company':       session.company_name,
-            'exported_at':   datetime.datetime.now().isoformat(),
-            'years_back':    years,
-            'date_range':    date_range,
-            'corrupt_safe':  args.corrupt_safe,
-            'extractor':     'QBExtract v2.0',
+            'company':        session.company_name,
+            'exported_at':    datetime.datetime.now().isoformat(),
+            'years_back':     years,
+            'date_range':     date_range,
+            'corrupt_safe':   args.corrupt_safe,
+            'gl':             not args.no_gl,
+            'gl_basis':       args.gl_basis,
+            'gl_granularity': args.gl_granularity,
+            'extractor':      'QBExtract v3.0',
         }
 
         # Masters first
@@ -1370,6 +1908,22 @@ def main():
         bundle['bills']              = extract_bills(session, years, date_range)
         bundle['bill_payments']      = extract_bill_payments(session, years, date_range)
         bundle['open_ar']            = extract_open_ar(session)
+
+        # General Ledger (report engine — Option A). Wrapped so a report-engine
+        # failure never loses the rest of the bundle.
+        if not args.no_gl:
+            bases = {'accrual': ('Accrual',), 'cash': ('Cash',),
+                     'both': ('Accrual', 'Cash')}[args.gl_basis]
+            try:
+                bundle['general_ledger'] = extract_general_ledger(
+                    session, years, date_range, bases=bases,
+                    granularity=args.gl_granularity,
+                    accounts=bundle.get('accounts'))
+            except Exception as e:
+                print(f"  GL extraction failed (continuing): {str(e)[:150]}")
+                bundle['general_ledger'] = []
+        else:
+            bundle['general_ledger'] = []
 
     except Exception as e:
         print(f"\nERROR: {e}")
@@ -1418,6 +1972,14 @@ def main():
     print(f"  Vendor Bills:      {len(bundle['bills'])}")
     print(f"  Bill Payments:     {len(bundle['bill_payments'])}")
     print(f"  Open AR items:     {len(bundle['open_ar'])}")
+    gl = bundle.get('general_ledger', [])
+    print(f"  General Ledger:    {len(gl)} lines")
+    if gl:
+        by_basis = {}
+        for r in gl:
+            by_basis[r['basis']] = by_basis.get(r['basis'], 0) + 1
+        for b in sorted(by_basis):
+            print(f"    {b} basis:       {by_basis[b]} lines")
     print(f"  File:              {filename}  ({size_mb:.1f} MB)")
     print()
     print("Send this file to your ERP consultant for import.")

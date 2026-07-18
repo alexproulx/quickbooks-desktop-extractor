@@ -2,7 +2,7 @@
 
 A free Python tool that exports QuickBooks Desktop / Enterprise data to a single JSON file via the QuickBooks SDK (QBXML). Built for ERP migrations — used in production to migrate real distributors off QuickBooks Desktop with 60K+ invoice histories, including a corrupt source file with 2,861 unfixable internal link errors.
 
-Outputs **20 entity types** in one bundle:
+Outputs **21 entity types** in one bundle:
 
 **Masters**
 - Chart of Accounts (with hierarchy via `parent`)
@@ -28,7 +28,16 @@ Outputs **20 entity types** in one bundle:
 - Bill Payments
 - Open AR (current open balances)
 
+**Ledger**
+- **General Ledger** — every posting line, on **both Accrual and Cash basis**, pulled through QuickBooks' own report engine so QBD generates the implicit balancing entries and computes cash-basis itself. This is the grain that feeds a Profit & Loss report and transaction-level drill-down.
+
 No Intuit cloud account or API key required. Uses the QB SDK, which talks to a locally-running QuickBooks Desktop / Enterprise instance.
+
+## What's new in v3
+
+- **General Ledger extraction.** The posting-line ledger, pulled via QuickBooks' report engine (`GeneralDetailReportQueryRq` with `GeneralDetailReportType = GeneralLedger`) rather than by re-deriving double-entry from raw transactions. Letting QBD produce the GL means it generates the implicit balancing entries and — with `<ReportBasis>Cash</ReportBasis>` — computes cash-basis itself, which is otherwise the hardest part of P&L replication. The extractor runs the report once per basis (**Accrual + Cash by default**) and tags every row with its basis. See [General Ledger](#general-ledger) below.
+- **GL amounts are exact decimal strings, never floats.** Money display strings (`"1,234.56"`, `"(1,234.56)"`) are parsed to `Decimal` and stored as strings so the GL reconciles to the penny downstream — binary float can't represent decimal cents exactly.
+- **`--probe-gl`** — a structure probe for the GL report. The report response is a `<ReportRet>` shape, not the entity `…Ret` blocks the other extractors parse, and whether it exposes each line's internal TxnID is version-dependent. Run the probe against the real company file first: it dumps the raw report XML and reports which columns come back and whether TxnID (needed for drill-down and attachment linking) is present.
 
 ## What's new in v2
 
@@ -84,6 +93,11 @@ QBExtract.py --year 2024                      # just 2024
 QBExtract.py --from-date 2024-01-01 --to-date 2024-06-30
 QBExtract.py --corrupt-safe --years 0         # full history, corrupt file
 QBExtract.py --output mybundle.json           # custom output path
+
+QBExtract.py --probe-gl --year 2024           # probe GL report structure, then exit
+QBExtract.py --gl-basis accrual               # GL on accrual basis only (default: both)
+QBExtract.py --gl-granularity quarter         # chunk GL reports by quarter (default: month)
+QBExtract.py --no-gl                          # skip General Ledger extraction
 ```
 
 ### Either way
@@ -105,6 +119,32 @@ If `Verify Data` / `Rebuild Data` reports unfixable link errors in your source f
 3. Watch the output for chunks that report `FAILED` or `ERROR`; those are recoverable by re-running just that range
 4. Compare totals on QB's own **Sales by Item Summary** report to the JSON sums per year to spot dropped data
 
+## General Ledger
+
+The General Ledger is the one extractor that does **not** read entity `…Ret` blocks. It calls QuickBooks' report engine — `GeneralDetailReportQueryRq` with `GeneralDetailReportType = GeneralLedger` — and parses the report response.
+
+**Why the report engine instead of rebuilding double-entry?** QuickBooks stores transactions (checks, deposits, journal entries, inventory adjustments, …), not a flat ledger. You could pull every posting transaction type and re-implement QBD's posting logic to derive the GL yourself, but that means re-deriving the implicit balancing entries *and* cash-basis conversion — months of work that rarely reconciles exactly. Letting QBD produce the GL means the report already contains the balancing entries, and running it with `<ReportBasis>Cash</ReportBasis>` gets QBD's own cash-basis numbers for free.
+
+**How it runs:**
+- Once per basis. `--gl-basis both` (default) runs Accrual and Cash; each posting line is tagged with `basis` and appears once per basis.
+- Chunked by calendar period (`--gl-granularity month` by default, or `quarter`). Each chunk is one `ReportPeriod`; a failed period is logged and skipped rather than losing the whole ledger — the same failure-isolation idea as the transaction extractors' year chunks.
+- Amounts are parsed from the report's display strings to `Decimal` and stored as strings — never `float()`.
+
+**Run the probe first.** The report response format is version-dependent in one important way: whether it exposes each posting line's internal **TxnID**. Downstream drill-down (P&L → transaction detail → attached PDF) and attachment linking need that GUID. Before relying on it, run:
+
+```bash
+QBExtract.py --probe-gl --year 2024
+```
+
+against the real company file. The probe runs one small GL report, writes the raw response to `<Company>_gl_probe_<YYYYMMDD>.xml`, and prints:
+- the report's columns (`ColType` / `ColTitle` → the field each maps to), so you can confirm the column mapping matches your QB version,
+- the row-type counts, and
+- **whether any `DataRow` carries a `<TxnID>`** — the key question. If it does, drill-down can link directly. If it doesn't, plan for RefNumber-based linking or a supplementary raw-transaction join on `txn_type` + `ref_number` + `date` + `amount`.
+
+The extractor captures TxnID when present and leaves it empty when not, so it works either way — but knowing which case you're in determines how the downstream drill-down is built.
+
+> **Correctness gate:** before trusting the GL, reconcile one full period to a native QuickBooks P&L (Reports → Company & Financial → Profit & Loss) to the penny, for both bases. Sum the `general_ledger` amounts for income/COGS/expense accounts over the period and compare.
+
 ## Output format
 
 Single JSON file:
@@ -117,7 +157,10 @@ Single JSON file:
     "years_back": 3,
     "date_range": null,
     "corrupt_safe": false,
-    "extractor": "QBExtract v2.0"
+    "gl": true,
+    "gl_basis": "both",
+    "gl_granularity": "month",
+    "extractor": "QBExtract v3.0"
   },
   "accounts":           [ /* chart of accounts with parent hierarchy */ ],
   "terms":              [ /* payment terms */ ],
@@ -138,9 +181,35 @@ Single JSON file:
   "purchase_orders":    [ /* PO headers + lines */ ],
   "bills":              [ /* bills with line_type=expense|item */ ],
   "bill_payments":      [ /* bill payment checks */ ],
-  "open_ar":            [ /* current unpaid invoices snapshot */ ]
+  "open_ar":            [ /* current unpaid invoices snapshot */ ],
+  "general_ledger":     [ /* posting lines, per basis — see below */ ]
 }
 ```
+
+Each `general_ledger` element is one posting line:
+
+```json
+{
+  "txn_id": "1000-9999999999",
+  "txn_type": "Check",
+  "ref_number": "1042",
+  "date": "2024-03-14",
+  "account_full_name": "Expenses:Rent Expense",
+  "account_list_id": "80000042-2222222222",
+  "account_type": "Expense",
+  "name": "Acme Supplies",
+  "memo": "Office rent",
+  "split": "Checking",
+  "class": "",
+  "amount": "1200.00",
+  "running_balance": "1200.00",
+  "basis": "Accrual"
+}
+```
+
+- `amount` is an **exact decimal string** (never a float) so downstream sums reconcile to the penny. `basis` is `"Accrual"` or `"Cash"`; with the default `--gl-basis both`, every posting line appears once per basis.
+- `account_full_name` / `account_list_id` / `account_type` are enriched by joining the report's account back to the extracted chart of accounts (by ListID, then FullName, then Name) rather than trusting the report's display text — this is what feeds P&L classification (Income / COGS / Expense) and sub-account roll-up.
+- `txn_id` is the internal transaction GUID **when the report exposes it** (see the probe note below); otherwise it is empty and downstream must link on `txn_type` + `ref_number` + `date` + `amount`.
 
 Each entity preserves its QB-side relationships via `FullName` references (the QB-native ID system). Customer FullName is unique within a company file; items use FullName for hierarchical groups; accounts likewise.
 
