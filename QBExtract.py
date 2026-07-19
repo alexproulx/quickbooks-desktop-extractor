@@ -1850,11 +1850,24 @@ Examples:
     return p.parse_args()
 
 
+def _pause_before_exit():
+    """Keep the console window open only when the tool was launched with no CLI
+    arguments — i.e. double-clicked as an EXE, where the window would otherwise
+    close before the user can read the output. Any terminal run that passes a
+    flag exits immediately instead of blocking on input."""
+    if len(sys.argv) > 1:
+        return
+    try:
+        input("\nPress ENTER to exit.")
+    except EOFError:
+        pass
+
+
 def main():
     args = parse_args()
 
     print("=" * 60)
-    print("QBExtract — QuickBooks Data Extractor (v2)")
+    print("QBExtract — QuickBooks Data Extractor (v3)")
     print("=" * 60)
     print()
 
@@ -1957,10 +1970,7 @@ def main():
         print(f"\nERROR: {e}")
         print()
         traceback.print_exc()
-        try:
-            input("\nPress ENTER to exit.")
-        except EOFError:
-            pass
+        _pause_before_exit()
         sys.exit(1)
     finally:
         session.disconnect()
@@ -2012,10 +2022,7 @@ def main():
     print()
     print("Send this file to your ERP consultant for import.")
     print()
-    try:
-        input("Press ENTER to exit.")
-    except EOFError:
-        pass
+    _pause_before_exit()
 
 
 if __name__ == '__main__':
