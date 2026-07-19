@@ -98,7 +98,18 @@ QBExtract.py --probe-gl --year 2024           # probe GL report structure, then 
 QBExtract.py --gl-basis accrual               # GL on accrual basis only (default: both)
 QBExtract.py --gl-granularity quarter         # chunk GL reports by quarter (default: month)
 QBExtract.py --no-gl                          # skip General Ledger extraction
+QBExtract.py --company-file "C:\QB\Company.QBW"   # open a specific file directly
 ```
+
+### Which company file gets exported
+
+By default the extractor runs against **whatever company file QuickBooks currently has open** — open your file in QuickBooks, then run the tool. QuickBooks only ever has one file open at a time, and the SDK cannot switch it.
+
+`--company-file "C:\path\to\Company.QBW"` opens a specific file directly, but only works when **either**:
+- QuickBooks is **closed** and this app has been granted **unattended access** (QuickBooks → Edit → Preferences → Integrated Applications → this app → "Allow access even when QuickBooks is not running"), and the file opens without an interactive login; **or**
+- QuickBooks is already **open with that same file** (identical to the default).
+
+If QuickBooks is open with a *different* file and you pass a path, `BeginSession` errors — close and reopen the right file, or use the default (no `--company-file`) with the file already open. The path is most useful for unattended/scheduled runs.
 
 ### Either way
 

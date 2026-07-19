@@ -88,11 +88,22 @@ from decimal import Decimal, InvalidOperation
 # and reads the response from another file.
 VBS_TEMPLATE = r'''
 ' QBExtract VBScript bridge — called by Python
-' Args: action, request_file, response_file
+' Args: action, request_file, response_file, [company_file]
 Dim action, reqFile, resFile
 action  = WScript.Arguments(0)
 reqFile = WScript.Arguments(1)
 resFile = WScript.Arguments(2)
+
+' Optional 4th arg: full path to a .QBW company file to open directly. Empty
+' string (the default) means "use the company file QuickBooks currently has
+' open." A specific path only works when QB is closed (and this app has
+' unattended access) or already open with that same file.
+Dim qbFile
+If WScript.Arguments.Count > 3 Then
+    qbFile = WScript.Arguments(3)
+Else
+    qbFile = ""
+End If
 
 Dim rp
 On Error Resume Next
@@ -122,10 +133,10 @@ If action = "connect" Then
 
     Dim ticket
     On Error Resume Next
-    ticket = rp.BeginSession("", 2)
+    ticket = rp.BeginSession(qbFile, 2)
     If Err.Number <> 0 Then
         Err.Clear
-        ticket = rp.BeginSession("", 0)
+        ticket = rp.BeginSession(qbFile, 0)
         If Err.Number <> 0 Then
             WriteFile resFile, "ERROR: BeginSession failed: " & Err.Description
             rp.CloseConnection
@@ -152,10 +163,10 @@ ElseIf action = "query" Then
     On Error GoTo 0
 
     On Error Resume Next
-    ticket = rp.BeginSession("", 2)
+    ticket = rp.BeginSession(qbFile, 2)
     If Err.Number <> 0 Then
         Err.Clear
-        ticket = rp.BeginSession("", 0)
+        ticket = rp.BeginSession(qbFile, 0)
     End If
     On Error GoTo 0
 
@@ -203,11 +214,18 @@ class QBSession:
 
     def __init__(self):
         self.company_name = ''
+        self.company_file = ''
         self._vbs_path = None
         self._req_path = None
         self._res_path = None
 
-    def connect(self):
+    def connect(self, company_file=''):
+        """Connect to QuickBooks. `company_file` is an optional full path to a
+        .QBW file to open directly; empty (the default) uses the file QB
+        currently has open. A path only works when QB is closed and this app
+        has unattended access, or QB is already open with that same file — the
+        SDK cannot switch QB from a different open file."""
+        self.company_file = company_file or ''
         # Write VBScript bridge to temp file
         self._vbs_path = os.path.join(tempfile.gettempdir(), 'qbextract_bridge.vbs')
         self._req_path = os.path.join(tempfile.gettempdir(), 'qbextract_req.xml')
@@ -247,7 +265,8 @@ class QBSession:
         try:
             proc = subprocess.run(
                 ['cscript', '//Nologo', self._vbs_path,
-                 action, self._req_path, self._res_path],
+                 action, self._req_path, self._res_path,
+                 self.company_file or ''],
                 capture_output=True, text=True, timeout=600
             )
         except FileNotFoundError:
@@ -1807,6 +1826,12 @@ Examples:
                    help='Transaction range end (YYYY-MM-DD). Overrides --years.')
     p.add_argument('--corrupt-safe', action='store_true',
                    help='Narrow master queries to non-history fields. Use for corrupt source files.')
+    p.add_argument('--company-file', dest='company_file', default=None,
+                   help='Full path to a .QBW file to open directly (e.g. '
+                        r'"C:\QB\Company.QBW"). Default: use the file QuickBooks '
+                        'currently has open. A path only works when QB is closed '
+                        '(and this app has unattended access) or already open '
+                        'with that same file.')
     p.add_argument('--gl-basis', dest='gl_basis',
                    choices=['accrual', 'cash', 'both'], default='both',
                    help='General Ledger report basis to extract (default: both). '
@@ -1864,7 +1889,9 @@ def main():
     bundle = {}
 
     try:
-        session.connect()
+        if args.company_file:
+            print(f"Opening company file: {args.company_file}")
+        session.connect(args.company_file or '')
         print()
 
         # GL structure probe: run against the real company file first to answer
@@ -1875,6 +1902,7 @@ def main():
 
         bundle['meta'] = {
             'company':        session.company_name,
+            'company_file':   args.company_file or '',
             'exported_at':    datetime.datetime.now().isoformat(),
             'years_back':     years,
             'date_range':     date_range,
