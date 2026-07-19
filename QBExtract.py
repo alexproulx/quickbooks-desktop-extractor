@@ -75,6 +75,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import traceback
 from decimal import Decimal, InvalidOperation
 
@@ -289,13 +290,41 @@ class QBSession:
 
         return result
 
-    def _send(self, request_xml):
-        """Send QBXML request via VBScript bridge, return response XML."""
-        with open(self._req_path, 'w', encoding='utf-16') as f:
-            f.write(request_xml)
+    # Transient SDK/COM failures worth retrying. Each _send is a full
+    # connect -> BeginSession -> ProcessRequest -> EndSession -> CloseConnection
+    # cycle, and occasionally BeginSession silently fails (QB momentarily busy
+    # or locked), so the follow-up ProcessRequest reports the session isn't
+    # there. Retrying a fresh cycle almost always clears it. Read-only queries
+    # are idempotent, so retrying is safe.
+    _RETRYABLE = (
+        'beginsession',
+        'has not been called',
+        'openconnection',
+        'could not begin',
+        'connection',
+        'busy',
+        'try again',
+        'is currently',
+    )
 
-        result = self._run_vbs('query')
-        return result
+    def _send(self, request_xml, retries=3):
+        """Send QBXML request via VBScript bridge, return response XML. Retries
+        transient SDK/COM hiccups (e.g. a failed BeginSession) with a short
+        backoff before giving up."""
+        last_err = None
+        for attempt in range(retries):
+            with open(self._req_path, 'w', encoding='utf-16') as f:
+                f.write(request_xml)
+            try:
+                return self._run_vbs('query')
+            except RuntimeError as e:
+                last_err = e
+                msg = str(e).lower()
+                if attempt < retries - 1 and any(s in msg for s in self._RETRYABLE):
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                raise
+        raise last_err
 
     def _company_query(self):
         return '<CompanyQueryRq requestID="1"></CompanyQueryRq>'
@@ -1847,14 +1876,19 @@ Examples:
                         'Run this against the real company file FIRST.')
     p.add_argument('--output', default=None,
                    help='Output JSON path. Default: <Company>_export_<YYYYMMDD>.json in cwd.')
+    p.add_argument('--no-pause', dest='no_pause', action='store_true',
+                   help='Do not wait for ENTER before exiting. Use when scripting '
+                        'or scheduling the extractor.')
     return p.parse_args()
 
 
-def _pause_before_exit():
-    """Keep the console window open only when the tool was launched with no CLI
-    arguments — i.e. double-clicked as an EXE, where the window would otherwise
-    close before the user can read the output. Any terminal run that passes a
-    flag exits immediately instead of blocking on input."""
+def _pause_before_exit(args=None):
+    """Keep the console window open so a double-clicked EXE doesn't close before
+    the user can read the output. Skipped when `--no-pause` is set, or when the
+    tool was launched with any CLI argument (a terminal/scripted run), so it
+    only ever blocks on a bare double-click."""
+    if args is not None and getattr(args, 'no_pause', False):
+        return
     if len(sys.argv) > 1:
         return
     try:
@@ -1970,7 +2004,7 @@ def main():
         print(f"\nERROR: {e}")
         print()
         traceback.print_exc()
-        _pause_before_exit()
+        _pause_before_exit(args)
         sys.exit(1)
     finally:
         session.disconnect()
@@ -2022,7 +2056,7 @@ def main():
     print()
     print("Send this file to your ERP consultant for import.")
     print()
-    _pause_before_exit()
+    _pause_before_exit(args)
 
 
 if __name__ == '__main__':

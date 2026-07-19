@@ -99,7 +99,10 @@ QBExtract.py --gl-basis accrual               # GL on accrual basis only (defaul
 QBExtract.py --gl-granularity quarter         # chunk GL reports by quarter (default: month)
 QBExtract.py --no-gl                          # skip General Ledger extraction
 QBExtract.py --company-file "C:\QB\Company.QBW"   # open a specific file directly
+QBExtract.py --year 2024 --no-pause               # no "Press ENTER to exit" — for scripting
 ```
+
+`--no-pause` suppresses the end-of-run "Press ENTER to exit" prompt so the extractor can be run from a script or scheduled task without blocking. (The prompt otherwise appears only on a bare double-click of the EXE, to keep the console window open.)
 
 ### Which company file gets exported
 
