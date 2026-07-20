@@ -31,6 +31,8 @@ Outputs **21 entity types** in one bundle:
 **Ledger**
 - **General Ledger** — every posting line, pulled through QuickBooks' own report engine so QBD generates the implicit balancing entries. Accrual basis by default; QBD can also compute cash basis on request (`--gl-basis cash`/`both`). This is the grain that feeds a Profit & Loss report and transaction-level drill-down.
 
+> **Default scope:** a normal run extracts only the **chart of accounts + General Ledger** — what a Profit & Loss needs. Pass **`--full`** to also pull all the other masters and transaction tables listed above (the complete ERP-migration bundle). The trimmed default runs far fewer SDK queries, so it's faster and much less exposed to the SDK's per-open hang risk.
+
 No Intuit cloud account or API key required. Uses the QB SDK, which talks to a locally-running QuickBooks Desktop / Enterprise instance.
 
 ## What's new in v3
@@ -95,11 +97,12 @@ QBExtract.py --corrupt-safe --years 0         # full history, corrupt file
 QBExtract.py --output mybundle.json           # custom output path
 
 QBExtract.py --probe-gl --year 2024           # probe GL report structure, then exit
-QBExtract.py --year 2024 --gl-only            # ONLY accounts + General Ledger (for P&L)
+QBExtract.py --year 2024                      # accounts + GL for 2024 (DEFAULT)
+QBExtract.py --full --years 0                 # complete ERP bundle (all masters + txns)
 QBExtract.py --gl-basis cash                  # GL on QBD-computed cash basis (default: accrual)
 QBExtract.py --gl-basis both                  # GL on both accrual and cash
 QBExtract.py --gl-granularity quarter         # chunk GL reports by quarter (default: month)
-QBExtract.py --no-gl                          # skip General Ledger extraction
+QBExtract.py --no-gl --full                   # ERP bundle without the General Ledger
 QBExtract.py --company-file "C:\QB\Company.QBW"   # open a specific file directly
 QBExtract.py --year 2024 --no-pause               # no "Press ENTER to exit" — for scripting
 ```
@@ -143,7 +146,7 @@ The General Ledger is the one extractor that does **not** read entity `…Ret` b
 
 **How it runs:**
 - Accrual basis by default. `--gl-basis cash` pulls QBD-computed cash basis instead; `--gl-basis both` pulls both, tagging each posting line with its `basis`.
-- **`--gl-only`** extracts just what a P&L needs — the chart of accounts plus the General Ledger — and skips every other master and transaction table. Because customers and items alone are 70+ name-range queries, this cuts the SDK query count (and thus the number of session opens that can hang) by an order of magnitude. Use it for the P&L pipeline; use the full extract only when you also need the ERP-migration tables.
+- **By default the extractor pulls only the chart of accounts plus the General Ledger** — exactly what a P&L needs — and skips every other master and transaction table. Because customers and items alone are 70+ name-range queries, this cuts the SDK query count (and thus the number of session opens that can hang) by an order of magnitude. Pass **`--full`** for the complete ERP-migration bundle when you also need those tables.
 - Chunked by calendar period (`--gl-granularity month` by default, or `quarter`). Each chunk is one `ReportPeriod`; a failed period is logged and skipped rather than losing the whole ledger — the same failure-isolation idea as the transaction extractors' year chunks.
 - Amounts are parsed from the report's display strings to `Decimal` and stored as strings — never `float()`.
 
@@ -191,7 +194,7 @@ Single JSON file:
     "years_back": 3,
     "date_range": null,
     "corrupt_safe": false,
-    "gl_only": false,
+    "full": false,
     "gl": true,
     "gl_basis": "accrual",
     "gl_granularity": "month",

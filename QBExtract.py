@@ -1858,16 +1858,16 @@ def parse_args():
         description="Extract QuickBooks Desktop data to a single JSON bundle.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
+By default this extracts accounts + General Ledger only (what a P&L needs).
+Pass --full for the complete ERP-migration bundle (all masters + transactions).
+
 Examples:
-  QBExtract.py                                  # interactive
-  QBExtract.py --years 3                        # last 3 years of transactions
-  QBExtract.py --years 0                        # all history
-  QBExtract.py --year 2024                      # only 2024
-  QBExtract.py --from-date 2024-01-01 --to-date 2024-06-30
-  QBExtract.py --corrupt-safe --years 0         # full history, corrupt file
+  QBExtract.py --year 2024                      # accounts + GL for 2024 (default)
+  QBExtract.py --years 3                        # accounts + GL, last 3 years
   QBExtract.py --probe-gl --year 2024           # probe GL report structure, exit
-  QBExtract.py --gl-basis accrual --years 3     # GL accrual only (default: both)
-  QBExtract.py --no-gl --years 3                # skip General Ledger
+  QBExtract.py --gl-basis cash --year 2024      # GL on QBD cash basis (default: accrual)
+  QBExtract.py --full --years 0                 # complete ERP bundle, all history
+  QBExtract.py --full --corrupt-safe --years 0  # complete bundle, corrupt file
 """)
     p.add_argument('--years', type=int, default=None,
                    help='Years of transaction history (0=all, default=3 if interactive declines).')
@@ -1896,11 +1896,12 @@ Examples:
                         'Smaller chunks isolate failures to a shorter period.')
     p.add_argument('--no-gl', dest='no_gl', action='store_true',
                    help='Skip General Ledger extraction.')
-    p.add_argument('--gl-only', dest='gl_only', action='store_true',
-                   help='Extract only what a P&L needs: chart of accounts + '
-                        'General Ledger. Skips all other masters and every '
-                        'transaction table. Far fewer SDK queries, so faster and '
-                        'much less exposure to per-open hangs.')
+    p.add_argument('--full', dest='full', action='store_true',
+                   help='Extract the complete ERP-migration bundle (all masters '
+                        'and every transaction table) in addition to accounts + '
+                        'General Ledger. Default is accounts + GL only — far fewer '
+                        'SDK queries, faster, and much less exposure to per-open '
+                        'hangs.')
     p.add_argument('--probe-gl', dest='probe_gl', action='store_true',
                    help='Run the GL report structure probe (TxnID check) and exit. '
                         'Run this against the real company file FIRST.')
@@ -1984,7 +1985,7 @@ def main():
             'years_back':     years,
             'date_range':     date_range,
             'corrupt_safe':   args.corrupt_safe,
-            'gl_only':        args.gl_only,
+            'full':           args.full,
             'gl':             not args.no_gl,
             'gl_basis':       args.gl_basis,
             'gl_granularity': args.gl_granularity,
@@ -1994,24 +1995,21 @@ def main():
         # Accounts always run: needed for GL P&L classification + hierarchy.
         bundle['accounts']           = extract_accounts(session)
 
-        # Everything below is for the full ERP-migration bundle and is NOT
-        # needed to reproduce a P&L from the GL. --gl-only skips it, which also
-        # cuts the query/BeginSession count dramatically (customers + items
-        # alone are 70+ name-range queries) — faster and far less exposure to
-        # the SDK's per-open hang risk.
-        _SKIPPED_SECTIONS = (
+        # By default we extract ONLY what a P&L needs: accounts + General Ledger.
+        # The masters and transaction tables below exist for the tool's original
+        # ERP-migration purpose and are redundant for P&L (the GL already holds
+        # every posting line). They run only under --full. Skipping them also
+        # cuts the query/BeginSession count by an order of magnitude (customers +
+        # items alone are 70+ name-range queries), which directly reduces
+        # exposure to the SDK's per-open hang risk.
+        _EXTRA_SECTIONS = (
             'terms', 'ship_methods', 'payment_methods', 'sales_tax_codes',
             'sales_tax_items', 'sales_reps', 'price_levels', 'quantity_discounts',
             'vendors', 'items', 'customers', 'invoices', 'payments',
             'credit_memos', 'sales_orders', 'purchase_orders', 'bills',
             'bill_payments', 'open_ar',
         )
-        if args.gl_only:
-            print("  [--gl-only] skipping masters and transaction extracts "
-                  "(accounts + general ledger only)")
-            for k in _SKIPPED_SECTIONS:
-                bundle[k] = []
-        else:
+        if args.full:
             # Masters
             bundle['terms']              = extract_terms(session)
             bundle['ship_methods']       = extract_ship_methods(session)
@@ -2034,6 +2032,11 @@ def main():
             bundle['bills']              = extract_bills(session, years, date_range)
             bundle['bill_payments']      = extract_bill_payments(session, years, date_range)
             bundle['open_ar']            = extract_open_ar(session)
+        else:
+            print("  Extracting accounts + General Ledger only "
+                  "(pass --full for the complete ERP bundle)")
+            for k in _EXTRA_SECTIONS:
+                bundle[k] = []
 
         # General Ledger (report engine — Option A). Wrapped so a report-engine
         # failure never loses the rest of the bundle.
@@ -2084,7 +2087,7 @@ def main():
     print("=" * 60)
     print(f"  Company:           {session.company_name}")
     print(f"  Accounts:          {len(bundle['accounts'])}")
-    if not args.gl_only:
+    if args.full:
         print(f"  Customers:         {len(bundle['customers'])}")
         print(f"  Items:             {len(bundle['items'])}")
         print(f"  Vendors:           {len(bundle['vendors'])}")
