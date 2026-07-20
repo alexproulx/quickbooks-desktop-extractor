@@ -210,6 +210,37 @@ End Function
 '''
 
 
+def _connect_error_hint(msg, company_file=''):
+    """Append actionable guidance to known connect-stage failures. The
+    auto-login/permission case is the common footgun: it means QB was asked to
+    open the file itself (QB closed, or --company-file given) without unattended
+    access granted, and a failed attempt can leave QuickBooks running headless
+    holding the file lock."""
+    low = msg.lower()
+    if any(s in low for s in ('log in', 'log into', 'automatic', 'permission',
+                              'administrator')):
+        return (
+            msg + "\n\n"
+            "  This app tried to open the company file AUTOMATICALLY "
+            + ("(--company-file was given)" if company_file
+               else "(QuickBooks was not open with the file)") + ",\n"
+            "  but it is not granted auto-login.\n\n"
+            "  EASIEST FIX: open QuickBooks, log in, and load the company file,\n"
+            "  then run this WITHOUT --company-file. An attached live session\n"
+            "  needs no auto-login permission.\n\n"
+            "  For unattended runs: QuickBooks > Edit > Preferences > Integrated\n"
+            "  Applications > Company Preferences > select 'QBExtract - ERP\n"
+            "  Importer' > check 'Allow this application to log in automatically'\n"
+            "  and choose a login user. If already granted, revoke it, Save, then\n"
+            "  grant again (a known QB quirk).\n\n"
+            "  NOTE: a failed auto-login can leave QuickBooks running in the\n"
+            "  background holding the file open. If QB then says the file is\n"
+            "  'already open', end the QBW32.EXE / QuickBooks.exe process in Task\n"
+            "  Manager (or reboot) before retrying."
+        )
+    return msg
+
+
 class QBSession:
     """Manages connection to QuickBooks via VBScript COM bridge."""
 
@@ -235,10 +266,15 @@ class QBSession:
         with open(self._vbs_path, 'w', encoding='utf-8') as f:
             f.write(VBS_TEMPLATE)
 
-        # Test connection
-        result = self._run_vbs('connect')
+        # Test connection. Note: connect is deliberately NOT retried — an
+        # auto-login/permission failure must fail fast, not relaunch QB
+        # repeatedly.
+        try:
+            result = self._run_vbs('connect')
+        except RuntimeError as e:
+            raise RuntimeError(_connect_error_hint(str(e), self.company_file)) from None
         if result.startswith('ERROR:'):
-            raise RuntimeError(result)
+            raise RuntimeError(_connect_error_hint(result, self.company_file))
 
         # Get company name
         xml = self._send(self._company_query())
@@ -306,6 +342,20 @@ class QBSession:
         'try again',
         'is currently',
     )
+    # Failures that must NOT be retried even if they also match _RETRYABLE — an
+    # auth/permission/config error won't fix itself, and retrying an auto-login
+    # failure just relaunches QuickBooks again and again.
+    _NONRETRYABLE = (
+        'permission',
+        'automatic',
+        'administrator',
+        'log in',
+        'log into',
+        'password',
+        'not enabled',
+        'not supported',
+        'invalid argument',
+    )
 
     def _send(self, request_xml, retries=3):
         """Send QBXML request via VBScript bridge, return response XML. Retries
@@ -320,7 +370,9 @@ class QBSession:
             except RuntimeError as e:
                 last_err = e
                 msg = str(e).lower()
-                if attempt < retries - 1 and any(s in msg for s in self._RETRYABLE):
+                retryable = (any(s in msg for s in self._RETRYABLE)
+                             and not any(s in msg for s in self._NONRETRYABLE))
+                if attempt < retries - 1 and retryable:
                     time.sleep(1.5 * (attempt + 1))
                     continue
                 raise
