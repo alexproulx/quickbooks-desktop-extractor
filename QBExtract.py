@@ -76,7 +76,6 @@ import re
 import subprocess
 import sys
 import tempfile
-import time
 import traceback
 from decimal import Decimal, InvalidOperation
 
@@ -327,57 +326,19 @@ class QBSession:
 
         return result
 
-    # Transient SDK/COM failures worth retrying. Each _send is a full
-    # connect -> BeginSession -> ProcessRequest -> EndSession -> CloseConnection
-    # cycle, and occasionally BeginSession silently fails (QB momentarily busy
-    # or locked), so the follow-up ProcessRequest reports the session isn't
-    # there. Retrying a fresh cycle almost always clears it. Read-only queries
-    # are idempotent, so retrying is safe.
-    _RETRYABLE = (
-        'beginsession',
-        'has not been called',
-        'openconnection',
-        'could not begin',
-        'connection',
-        'busy',
-        'try again',
-        'is currently',
-    )
-    # Failures that must NOT be retried even if they also match _RETRYABLE — an
-    # auth/permission/config error won't fix itself, and retrying an auto-login
-    # failure just relaunches QuickBooks again and again.
-    _NONRETRYABLE = (
-        'permission',
-        'automatic',
-        'administrator',
-        'log in',
-        'log into',
-        'password',
-        'not enabled',
-        'not supported',
-        'invalid argument',
-    )
+    def _send(self, request_xml):
+        """Send QBXML request via VBScript bridge, return response XML.
 
-    def _send(self, request_xml, retries=3):
-        """Send QBXML request via VBScript bridge, return response XML. Retries
-        transient SDK/COM hiccups (e.g. a failed BeginSession) with a short
-        backoff before giving up."""
-        last_err = None
-        for attempt in range(retries):
-            with open(self._req_path, 'w', encoding='utf-16') as f:
-                f.write(request_xml)
-            try:
-                return self._run_vbs('query')
-            except RuntimeError as e:
-                last_err = e
-                msg = str(e).lower()
-                retryable = (any(s in msg for s in self._RETRYABLE)
-                             and not any(s in msg for s in self._NONRETRYABLE))
-                if attempt < retries - 1 and retryable:
-                    time.sleep(1.5 * (attempt + 1))
-                    continue
-                raise
-        raise last_err
+        No automatic retry: each call is a full connect -> BeginSession ->
+        ProcessRequest -> EndSession -> CloseConnection cycle, and re-firing it
+        immediately after a failure hammers QuickBooks with a fresh connection
+        while it is still unstable — which can crash QB. A failed request is
+        logged by the caller and its chunk skipped; re-run that period instead."""
+        with open(self._req_path, 'w', encoding='utf-16') as f:
+            f.write(request_xml)
+
+        result = self._run_vbs('query')
+        return result
 
     def _company_query(self):
         return '<CompanyQueryRq requestID="1"></CompanyQueryRq>'
