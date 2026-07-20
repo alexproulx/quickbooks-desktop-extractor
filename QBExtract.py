@@ -1885,6 +1885,139 @@ def probe_gl_report(session, date_range=None):
 
 
 # ============================================================================
+# TRANSACTION INDEX — TxnID source for GL -> attachment linking
+# ============================================================================
+#
+# The GL report never exposes TxnID. TransactionQueryRq (qbXML's generic
+# "Advanced Find") returns TxnID + TxnType + RefNumber + TxnDate + Amount +
+# entity across ALL posting types in one query, so it's the join source: match
+# each GL line to a transaction on (RefNumber, TxnDate) [+ type] and carry the
+# TxnID onto the GL row. One TxnID covers all of a transaction's GL lines, which
+# is exactly the grain an attachment attaches to.
+
+
+def _txn_query_request(from_date, to_date, request_id='398'):
+    """TransactionQueryRq over a date range — one query, all posting types,
+    returns TxnID/TxnType/RefNumber/TxnDate/Amount/entity per transaction."""
+    return f"""
+    <TransactionQueryRq requestID="{request_id}">
+{_txn_date_filter(from_date, to_date)}
+    </TransactionQueryRq>
+    """
+
+
+def _parse_transaction_blocks(xml):
+    """Parse <TransactionRet> blocks into transaction-index dicts."""
+    out = []
+    for b in xml_blocks(xml, 'TransactionRet'):
+        out.append({
+            'txn_id':     clean(xml_val(b, 'TxnID')),
+            'txn_type':   clean(xml_val(b, 'TxnType')),
+            'date':       clean(xml_val(b, 'TxnDate')),
+            'ref_number': clean(xml_val(b, 'RefNumber')),
+            'entity':     clean(xml_ref(b, 'EntityRef', 'FullName')),
+            'account':    clean(xml_ref(b, 'AccountRef', 'FullName')),
+            'amount':     clean(xml_val(b, 'Amount')),
+        })
+    return out
+
+
+def probe_txn_query(session, date_range=None):
+    """Diagnostic: run ONE TransactionQueryRq over a small window, dump the raw
+    response, and empirically test the GL->TxnID join for the same window.
+    Reports whether TxnID comes back, how cleanly GL lines match transactions on
+    (RefNumber, Date), and the distinct type vocabularies on each side (so a
+    type-normalization map can be built from real data). Run BEFORE building the
+    transaction-index feature and the attachment layer."""
+    today = datetime.date.today()
+    if date_range is not None:
+        from_date, to_date = date_range
+        from_date = from_date or today.replace(day=1).strftime('%Y-%m-%d')
+        to_date = to_date or today.strftime('%Y-%m-%d')
+    else:
+        last_prev = today.replace(day=1) - datetime.timedelta(days=1)
+        from_date = last_prev.replace(day=1).strftime('%Y-%m-%d')
+        to_date = last_prev.strftime('%Y-%m-%d')
+
+    print("=" * 60)
+    print("TRANSACTION QUERY PROBE  (GL -> TxnID join test)")
+    print("=" * 60)
+    print(f"  Window: {from_date} to {to_date}")
+
+    # 1. TransactionQuery ----------------------------------------------------
+    txn_xml = session._send(_txn_query_request(from_date, to_date))
+    safe_name = ''.join(c if c.isalnum() or c in (' ', '-', '_') else '_'
+                        for c in (session.company_name or 'company')).strip()
+    dump = os.path.join(os.getcwd(),
+                        f"{safe_name}_txn_probe_{today.strftime('%Y%m%d')}.xml")
+    with open(dump, 'w', encoding='utf-8') as f:
+        f.write(txn_xml)
+    print(f"  Raw response written to: {os.path.basename(dump)}  "
+          f"({len(txn_xml)} bytes)")
+
+    m = re.search(r'<TransactionQueryRs\b([^>]*)>', txn_xml)
+    if m:
+        a = _tag_attrs(m.group(1))
+        print(f"  statusCode={a.get('statusCode', '?')} "
+              f"statusMessage={a.get('statusMessage', '')[:80]}")
+
+    txns = _parse_transaction_blocks(txn_xml)
+    with_id = sum(1 for t in txns if t['txn_id'])
+    with_ref = sum(1 for t in txns if t['ref_number'])
+    print(f"\n  Transactions returned: {len(txns)}")
+    print(f"    with TxnID:     {with_id}   <-- the anchor for attachments")
+    print(f"    with RefNumber: {with_ref}")
+    if txns:
+        print("  Sample transactions:")
+        for t in txns[:3]:
+            print(f"    {t}")
+
+    # 2. GL for the same window ---------------------------------------------
+    gl_xml = session._send(_gl_report_request(from_date, to_date, 'Accrual'))
+    gl_rows, _, _ = parse_general_ledger_report(gl_xml, 'Accrual')
+    print(f"\n  GL posting lines (same window): {len(gl_rows)}")
+
+    # 3. Empirical join on (RefNumber, Date) --------------------------------
+    by_ref_date = {}
+    for t in txns:
+        if t['ref_number']:
+            by_ref_date.setdefault((t['ref_number'], t['date']), []).append(t)
+
+    gl_with_ref = [r for r in gl_rows if r['ref_number']]
+    clean_match = ambiguous = nomatch = 0
+    for r in gl_with_ref:
+        hits = by_ref_date.get((r['ref_number'], r['date']), [])
+        if len(hits) == 1:
+            clean_match += 1
+        elif len(hits) > 1:
+            ambiguous += 1
+        else:
+            nomatch += 1
+    gl_no_ref = len(gl_rows) - len(gl_with_ref)
+    pct = (100.0 * clean_match / len(gl_rows)) if gl_rows else 0.0
+
+    print("\n  GL -> TxnID join on (RefNumber, Date):")
+    print(f"    GL lines with a RefNumber:    {len(gl_with_ref)} / {len(gl_rows)}")
+    print(f"      clean 1:1 match:            {clean_match}  ({pct:.0f}% of all GL lines)")
+    print(f"      ambiguous (>1 txn):         {ambiguous}")
+    print(f"      no matching txn:            {nomatch}")
+    print(f"    GL lines with NO RefNumber:   {gl_no_ref}  "
+          f"(need a type+amount+date fallback)")
+
+    # 4. Type vocabularies (to build the normalization map) -----------------
+    def _hist(items, key):
+        h = {}
+        for x in items:
+            h[x[key]] = h.get(x[key], 0) + 1
+        return dict(sorted(h.items(), key=lambda kv: -kv[1]))
+
+    print(f"\n  Distinct GL txn_type values:        {_hist(gl_rows, 'txn_type')}")
+    print(f"  Distinct TransactionQuery TxnTypes: {_hist(txns, 'txn_type')}")
+    print("  (map GL display types -> TransactionQuery enum types from the two lists above)")
+    print("=" * 60)
+
+
+# ============================================================================
 # CLI / MAIN
 # ============================================================================
 
@@ -1944,6 +2077,10 @@ Examples:
     p.add_argument('--probe-gl', dest='probe_gl', action='store_true',
                    help='Run the GL report structure probe (TxnID check) and exit. '
                         'Run this against the real company file FIRST.')
+    p.add_argument('--probe-txn', dest='probe_txn', action='store_true',
+                   help='Run the TransactionQuery probe and exit: tests the '
+                        'GL->TxnID join (for attachment linking) against a small '
+                        'window and reports the match rate.')
     p.add_argument('--output', default=None,
                    help='Output JSON path. Default: <Company>_export_<YYYYMMDD>.json in cwd.')
     p.add_argument('--no-pause', dest='no_pause', action='store_true',
@@ -2015,6 +2152,9 @@ def main():
         # the TxnID question, then exit without writing the full bundle.
         if args.probe_gl:
             probe_gl_report(session, date_range)
+            return
+        if args.probe_txn:
+            probe_txn_query(session, date_range)
             return
 
         bundle['meta'] = {
