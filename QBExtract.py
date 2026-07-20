@@ -1565,9 +1565,10 @@ def parse_general_ledger_report(xml, basis, accounts_index=None):
     """Parse one GeneralDetailReportQueryRs (General Ledger) into posting-line
     dicts, tagged with `basis` ('Accrual'|'Cash').
 
-    Walks ReportData statefully: the account comes from the most recent section
-    header (TextRow, or a DataRow with rowType='account'), carried onto each
-    posting DataRow beneath it. Subtotal/Total rows are skipped — downstream
+    Walks ReportData statefully. The account is carried from each row's
+    <RowData rowType="account"> tag (present on both the section header and the
+    transaction rows) onto the posting line. Header / opening-balance rows (no
+    Txn Type, no Amount) and Subtotal/Total rows are skipped — downstream
     re-aggregates from raw amounts. `accounts_index` (from `_index_accounts`)
     enriches account_full_name/account_type/list_id from the extracted master
     instead of trusting the report's display text.
@@ -1618,13 +1619,16 @@ def parse_general_ledger_report(xml, basis, accounts_index=None):
                 cur_account_list_id = rd['list_id']
             continue
 
-        # DataRow. Some GL layouts emit the account header as a DataRow with
-        # rowType='account' instead of a TextRow — treat that as a header too.
-        if rd['rowType'] in ('account', 'section'):
-            if rd['value']:
-                cur_account = clean(rd['value'])
-                cur_account_list_id = rd['list_id']
-            continue
+        # DataRow. In the General Ledger the account is not merely a section
+        # header — EVERY row (the account header AND each transaction beneath
+        # it) carries <RowData rowType="account" value="<account>"> naming the
+        # account it belongs to. So use rowType='account' to (re)set the current
+        # account, but do NOT skip the row: fall through and parse its ColData.
+        # The true header / opening-balance / beginning-balance rows carry no
+        # Txn Type and no Amount and are dropped by the posting-line check below.
+        if rd['rowType'] in ('account', 'section') and rd['value']:
+            cur_account = clean(rd['value'])
+            cur_account_list_id = rd['list_id']
 
         colvals = {}
         for c in _COLDATA_RE.findall(body):
@@ -1651,9 +1655,11 @@ def parse_general_ledger_report(xml, basis, accounts_index=None):
             else:
                 rec[field] = clean(raw)
 
-        # Skip blank spacer DataRows (no meaningful posting content).
-        if not any((rec['txn_type'], rec['ref_number'], rec['date'],
-                    rec['amount'], rec['name'], rec['memo'])):
+        # A real posting line has a transaction type and/or an amount. Account
+        # header, opening-balance and beginning-balance rows have neither (only
+        # a label plus a running balance) and are dropped. Running balances are
+        # recomputed downstream, so nothing is lost.
+        if not (rec['txn_type'] or rec['amount']):
             continue
 
         acct_name = cur_account
@@ -1847,9 +1853,13 @@ def probe_gl_report(session, date_range=None):
     dm = re.search(r'<ReportData\b.*?</ReportData>', report, re.DOTALL)
     data = dm.group(0) if dm else ''
     counts = {}
+    rowtype_hist = {}
     for rm in _GL_ROW_RE.finditer(data):
         counts[rm.group(1)] = counts.get(rm.group(1), 0) + 1
+        rt = _parse_rowdata(rm.group(2))['rowType'] or '(none)'
+        rowtype_hist[rt] = rowtype_hist.get(rt, 0) + 1
     print(f"\n  Row types: {counts}")
+    print(f"  RowData rowType histogram: {rowtype_hist}")
 
     # TxnID presence — THE key question for drill-down.
     data_rows = re.findall(r'<DataRow\b.*?</DataRow>', data, re.DOTALL)
