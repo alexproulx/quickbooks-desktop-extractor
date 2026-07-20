@@ -2109,8 +2109,18 @@ def main():
     else:
         safe_name = ''.join(c if c.isalnum() or c in (' ', '-', '_') else '_'
                             for c in session.company_name).strip()
-        date_str  = datetime.date.today().strftime('%Y%m%d')
-        filename  = f"{safe_name}_export_{date_str}.json"
+        # Tag the filename with the extracted period so per-year runs don't
+        # overwrite each other (--year 2023 vs --year 2024 must land in
+        # separate files).
+        if args.year:
+            period = str(args.year)
+        elif date_range is not None:
+            frm = (date_range[0] or 'start').replace('-', '')
+            to  = (date_range[1] or 'today').replace('-', '')
+            period = f"{frm}-{to}"
+        else:
+            period = datetime.date.today().strftime('%Y%m%d')
+        filename  = f"{safe_name}_export_{period}.json"
         filepath  = os.path.join(os.getcwd(), filename)
 
     print()

@@ -166,6 +166,28 @@ The extractor captures TxnID when present and leaves it empty when not, so it wo
 
 > **Correctness gate:** before trusting the GL, reconcile one full period to a native QuickBooks P&L (Reports → Company & Financial → Profit & Loss) to the penny. Run `reconcile_pnl.py` on the export (see [Reconciling to QuickBooks](#reconciling-to-quickbooks)) and compare its NET INCOME and section totals against QuickBooks' P&L for the same period and basis.
 
+## Exporting all history (one file per year)
+
+For a full-history GL pull, run **one invocation per year** rather than one giant run. Each invocation is its own QuickBooks session and just 2 SDK calls (accounts + one year-granularity GL report), so it's light on QuickBooks and a hang on one year doesn't cost you the others — you re-run just that year. The output filename is tagged with the period (`<Company>_export_2024.json`), so per-year runs don't overwrite each other.
+
+`export_years.ps1` does the loop for you:
+
+```powershell
+# QuickBooks must already be OPEN with the company file loaded. Do NOT use --company-file.
+.\export_years.ps1 -StartYear 2015                 # 2015..this year, one file per year
+.\export_years.ps1 -StartYear 2018 -EndYear 2024   # explicit range
+```
+
+It writes `exports\qbgl_<year>.json` per year, kills and skips any year that hangs past a timeout (default 30 min), and prints a summary with the exact command to re-run any failed year. Or do it by hand:
+
+```powershell
+python QBExtract.py --year 2024 --gl-granularity year --no-pause
+python QBExtract.py --year 2023 --gl-granularity year --no-pause
+...
+```
+
+Each yearly file includes the chart of accounts, so `reconcile_pnl.py` works on any of them independently. Chunking is transport-only — a per-year set of files carries the same posting lines as one combined pull, and you re-aggregate across years downstream.
+
 ## Reconciling to QuickBooks
 
 `reconcile_pnl.py` reads an export bundle and rebuilds a QuickBooks-style Profit & Loss from the `general_ledger` posting lines, so you can compare it — to the penny — against QuickBooks' own report. It touches no QuickBooks and needs no Windows (it only reads the JSON), so run it anywhere, including on a Mac:
