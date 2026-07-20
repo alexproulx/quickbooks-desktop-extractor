@@ -27,6 +27,7 @@ Sign convention:
 
 import argparse
 import json
+import re
 import sys
 from decimal import Decimal, InvalidOperation
 
@@ -66,22 +67,54 @@ def _fmt(d):
     return f"({body})" if q < 0 else body
 
 
+# QB General Ledger labels accounts as "<number> . <name>" (or "<number> ·
+# <name>") when account numbers are turned on. Split off a leading token and a
+# '.'/'·' separator so we can match on the account number.
+_ACCT_LABEL_RE = re.compile(r'^\s*(\S+)\s*[.·]\s*(.+)$')
+
+
 def _index_accounts(accounts):
-    """full_name/name -> account dict, for classifying GL rows by account type."""
-    by_full, by_name = {}, {}
+    """Index the chart of accounts for classifying GL rows. Keys by
+    account_number as well as full_name/name, because the GL report labels
+    numbered accounts as "<number> . <name>"."""
+    idx = {'by_number': {}, 'by_full': {}, 'by_name': {}}
     for a in accounts or []:
+        num = str(a.get('account_number') or '').strip()
+        if num:
+            idx['by_number'].setdefault(num, a)
         if a.get('full_name'):
-            by_full.setdefault(a['full_name'], a)
+            idx['by_full'].setdefault(a['full_name'], a)
         if a.get('name'):
-            by_name.setdefault(a['name'], a)
-    return by_full, by_name
+            idx['by_name'].setdefault(a['name'], a)
+    return idx
 
 
-def _classify(row, by_full, by_name):
+def _match_account(label, idx):
+    """Match a GL report account label to a master account dict, or None.
+    Tries exact full_name/name first, then the "<number> . <name>" form."""
+    label = (label or '').strip()
+    if not label:
+        return None
+    hit = idx['by_full'].get(label) or idx['by_name'].get(label)
+    if hit:
+        return hit
+    m = _ACCT_LABEL_RE.match(label)
+    if m:
+        num, rest = m.group(1).strip(), m.group(2).strip()
+        hit = idx['by_number'].get(num)
+        if hit:
+            return hit
+        hit = idx['by_full'].get(rest) or idx['by_name'].get(rest)
+        if hit:
+            return hit
+    return None
+
+
+def _classify(row, idx):
     """Return (account_full_name, account_type) for a GL row, preferring the
     accounts master over the row's own (possibly un-enriched) fields."""
     full = row.get('account_full_name', '')
-    acct = by_full.get(full) or by_name.get(full)
+    acct = _match_account(full, idx)
     if acct:
         return acct.get('full_name') or full, acct.get('account_type', '')
     # Fall back to whatever the extractor enriched onto the row.
@@ -92,7 +125,7 @@ def build_pnl(bundle, basis):
     """Aggregate the bundle's general_ledger for one basis into per-account and
     per-type totals. Returns a dict with account sums, type sums, and the
     all-accounts control total (should be ~0 for a complete double-entry set)."""
-    by_full, by_name = _index_accounts(bundle.get('accounts'))
+    idx = _index_accounts(bundle.get('accounts'))
     gl = [r for r in bundle.get('general_ledger', []) if r.get('basis') == basis]
 
     per_account = {}      # full_name -> {'type':.., 'raw': Decimal}
@@ -102,7 +135,7 @@ def build_pnl(bundle, basis):
     for r in gl:
         amt = _dec(r.get('amount'))
         control_total += amt
-        full, atype = _classify(r, by_full, by_name)
+        full, atype = _classify(r, idx)
         if atype not in PNL_TYPES:
             if not atype:
                 unclassified['count'] += 1

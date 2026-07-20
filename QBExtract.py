@@ -1509,10 +1509,17 @@ def _parse_rowdata(row_body):
     }
 
 
+# QB General Ledger labels accounts as "<number> . <name>" (or "<number> ·
+# <name>") when account numbers are turned on. Split off a leading token and a
+# '.'/'·' separator so the report label can be matched on the account number.
+_ACCT_LABEL_RE = re.compile(r'^\s*(\S+)\s*[.·]\s*(.+)$')
+
+
 def _index_accounts(accounts):
     """Index the extracted chart of accounts for GL enrichment: match a report's
-    account row back to the master by ListID (best), then FullName, then Name."""
-    idx = {'by_list_id': {}, 'by_full_name': {}, 'by_name': {}}
+    account row back to the master by ListID (best), account number, FullName,
+    then Name."""
+    idx = {'by_list_id': {}, 'by_full_name': {}, 'by_name': {}, 'by_number': {}}
     for a in accounts or []:
         if a.get('list_id'):
             idx['by_list_id'][a['list_id']] = a
@@ -1520,7 +1527,32 @@ def _index_accounts(accounts):
             idx['by_full_name'].setdefault(a['full_name'], a)
         if a.get('name'):
             idx['by_name'].setdefault(a['name'], a)
+        num = str(a.get('account_number') or '').strip()
+        if num:
+            idx['by_number'].setdefault(num, a)
     return idx
+
+
+def _match_report_account(label, idx):
+    """Match a GL report account label ("<number> . <name>", or a bare name) to
+    a master account dict, or None. Exact full_name/name first, then by the
+    account number parsed from the "<number> . <name>" form."""
+    label = (label or '').strip()
+    if not label:
+        return None
+    hit = idx['by_full_name'].get(label) or idx['by_name'].get(label)
+    if hit:
+        return hit
+    m = _ACCT_LABEL_RE.match(label)
+    if m:
+        num, rest = m.group(1).strip(), m.group(2).strip()
+        hit = idx['by_number'].get(num)
+        if hit:
+            return hit
+        hit = idx['by_full_name'].get(rest) or idx['by_name'].get(rest)
+        if hit:
+            return hit
+    return None
 
 
 def parse_general_ledger_report(xml, basis, accounts_index=None):
@@ -1626,18 +1658,18 @@ def parse_general_ledger_report(xml, basis, accounts_index=None):
 
         acct_name = cur_account
         acct_type = ''
+        acct_number = ''
         acct_list_id = cur_account_list_id
         if accounts_index:
             hit = None
             if acct_list_id and acct_list_id in accounts_index['by_list_id']:
                 hit = accounts_index['by_list_id'][acct_list_id]
-            elif cur_account in accounts_index['by_full_name']:
-                hit = accounts_index['by_full_name'][cur_account]
-            elif cur_account in accounts_index['by_name']:
-                hit = accounts_index['by_name'][cur_account]
+            else:
+                hit = _match_report_account(cur_account, accounts_index)
             if hit:
                 acct_name = hit.get('full_name') or acct_name
                 acct_type = hit.get('account_type', '')
+                acct_number = hit.get('account_number', '')
                 acct_list_id = hit.get('list_id') or acct_list_id
 
         rows_out.append({
@@ -1646,6 +1678,7 @@ def parse_general_ledger_report(xml, basis, accounts_index=None):
             'ref_number':        rec['ref_number'],
             'date':              rec['date'],
             'account_full_name': acct_name,
+            'account_number':    acct_number,
             'account_list_id':   acct_list_id,
             'account_type':      acct_type,
             'name':              rec['name'],

@@ -233,7 +233,8 @@ Each `general_ledger` element is one posting line:
   "txn_type": "Check",
   "ref_number": "1042",
   "date": "2024-03-14",
-  "account_full_name": "Expenses:Rent Expense",
+  "account_full_name": "Rent Expense",
+  "account_number": "6000",
   "account_list_id": "80000042-2222222222",
   "account_type": "Expense",
   "name": "Acme Supplies",
@@ -247,7 +248,7 @@ Each `general_ledger` element is one posting line:
 ```
 
 - `amount` is an **exact decimal string** (never a float) so downstream sums reconcile to the penny. `basis` is `"Accrual"` or `"Cash"`; by default only accrual is pulled, and with `--gl-basis both` every posting line appears once per basis.
-- `account_full_name` / `account_list_id` / `account_type` are enriched by joining the report's account back to the extracted chart of accounts (by ListID, then FullName, then Name) rather than trusting the report's display text — this is what feeds P&L classification (Income / COGS / Expense) and sub-account roll-up.
+- `account_full_name` / `account_number` / `account_list_id` / `account_type` are enriched by joining the report's account back to the extracted chart of accounts — this is what feeds P&L classification (Income / COGS / Expense) and sub-account roll-up. When account numbers are on, the GL labels accounts as `"<number> . <name>"`; the join matches on the parsed account number (then FullName, then Name), so numbered accounts classify correctly.
 - `txn_id` is the internal transaction GUID **when the report exposes it** (see the probe note below); otherwise it is empty and downstream must link on `txn_type` + `ref_number` + `date` + `amount`.
 
 Each entity preserves its QB-side relationships via `FullName` references (the QB-native ID system). Customer FullName is unique within a company file; items use FullName for hierarchical groups; accounts likewise.
