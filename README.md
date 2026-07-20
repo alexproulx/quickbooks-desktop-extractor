@@ -101,6 +101,7 @@ QBExtract.py --year 2024                      # accounts + GL for 2024 (DEFAULT)
 QBExtract.py --full --years 0                 # complete ERP bundle (all masters + txns)
 QBExtract.py --gl-basis cash                  # GL on QBD-computed cash basis (default: accrual)
 QBExtract.py --gl-basis both                  # GL on both accrual and cash
+QBExtract.py --years 0 --gl-granularity year  # ALL history, fewest SDK calls (one report/year)
 QBExtract.py --gl-granularity quarter         # chunk GL reports by quarter (default: month)
 QBExtract.py --no-gl --full                   # ERP bundle without the General Ledger
 QBExtract.py --company-file "C:\QB\Company.QBW"   # open a specific file directly
@@ -147,7 +148,7 @@ The General Ledger is the one extractor that does **not** read entity `…Ret` b
 **How it runs:**
 - Accrual basis by default. `--gl-basis cash` pulls QBD-computed cash basis instead; `--gl-basis both` pulls both, tagging each posting line with its `basis`.
 - **By default the extractor pulls only the chart of accounts plus the General Ledger** — exactly what a P&L needs — and skips every other master and transaction table. Because customers and items alone are 70+ name-range queries, this cuts the SDK query count (and thus the number of session opens that can hang) by an order of magnitude. Pass **`--full`** for the complete ERP-migration bundle when you also need those tables.
-- Chunked by calendar period (`--gl-granularity month` by default, or `quarter`). Each chunk is one `ReportPeriod`; a failed period is logged and skipped rather than losing the whole ledger — the same failure-isolation idea as the transaction extractors' year chunks.
+- Chunked by calendar period (`--gl-granularity month` by default, or `quarter`/`year`). Each chunk is one `ReportPeriod`; a failed period is logged and skipped rather than losing the whole ledger — the same failure-isolation idea as the transaction extractors' year chunks. **Chunking is a transport concern only — it does not affect reporting.** Every row is emitted flat with its own date/account/amount/basis, so you re-aggregate into any period downstream regardless of chunk size; a month-chunked and a year-chunked pull produce identical posting lines. The one exception is `running_balance` (per-chunk, not cumulative across the whole history) — irrelevant for a P&L, which sums `amount`. Smaller chunks isolate failures more finely; larger chunks mean far fewer SDK calls (fewer `BeginSession` opens that can hang), so **use `year` for all-history pulls**.
 - Amounts are parsed from the report's display strings to `Decimal` and stored as strings — never `float()`.
 
 **Run the probe first.** The report response format is version-dependent in one important way: whether it exposes each posting line's internal **TxnID**. Downstream drill-down (P&L → transaction detail → attached PDF) and attachment linking need that GUID. Before relying on it, run:

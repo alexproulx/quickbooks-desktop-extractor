@@ -1684,10 +1684,14 @@ def _build_report_period_chunks(years_back, date_range, granularity='month'):
         start = datetime.date(today.year - yb + 1, 1, 1)
         end = today
 
-    step = 3 if granularity == 'quarter' else 1
-    if granularity == 'quarter':
+    if granularity == 'year':
+        step = 12
+        start = datetime.date(start.year, 1, 1)
+    elif granularity == 'quarter':
+        step = 3
         start = datetime.date(start.year, ((start.month - 1) // 3) * 3 + 1, 1)
-    else:
+    else:  # month
+        step = 1
         start = datetime.date(start.year, start.month, 1)
 
     windows = []
@@ -1891,9 +1895,11 @@ Examples:
                         'Use "cash" or "both" to also/instead pull QBD-computed '
                         'cash basis.')
     p.add_argument('--gl-granularity', dest='gl_granularity',
-                   choices=['month', 'quarter'], default='month',
+                   choices=['month', 'quarter', 'year'], default='month',
                    help='Calendar chunk size for GL report queries (default: month). '
-                        'Smaller chunks isolate failures to a shorter period.')
+                        'Smaller chunks isolate failures to a shorter period; larger '
+                        'chunks mean far fewer SDK calls (use "year" for all-history '
+                        'pulls to minimize per-open hang exposure).')
     p.add_argument('--no-gl', dest='no_gl', action='store_true',
                    help='Skip General Ledger extraction.')
     p.add_argument('--full', dest='full', action='store_true',
