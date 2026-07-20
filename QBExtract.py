@@ -1898,12 +1898,20 @@ def probe_gl_report(session, date_range=None):
 
 def _txn_query_request(from_date, to_date, request_id='398'):
     """TransactionQueryRq over a date range — one query, all posting types,
-    returns TxnID/TxnType/RefNumber/TxnDate/Amount/entity per transaction."""
-    return f"""
-    <TransactionQueryRq requestID="{request_id}">
-{_txn_date_filter(from_date, to_date)}
-    </TransactionQueryRq>
-    """
+    returns TxnID/TxnType/RefNumber/TxnDate/Amount/entity per transaction.
+
+    NOTE: the generic TransactionQueryRq uses `TransactionDateRangeFilter`
+    (Transaction*-prefixed filter names), NOT the `TxnDateRangeFilter` that the
+    entity queries (InvoiceQueryRq etc.) use — a different qbXML schema."""
+    parts = [f'    <TransactionQueryRq requestID="{request_id}">',
+             '      <TransactionDateRangeFilter>']
+    if from_date:
+        parts.append(f'        <FromTxnDate>{from_date}</FromTxnDate>')
+    if to_date:
+        parts.append(f'        <ToTxnDate>{to_date}</ToTxnDate>')
+    parts.append('      </TransactionDateRangeFilter>')
+    parts.append('    </TransactionQueryRq>')
+    return '\n'.join(parts)
 
 
 def _parse_transaction_blocks(xml):
