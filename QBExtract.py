@@ -9,8 +9,9 @@ What's new in v3 (2026-07):
     own report engine (`GeneralDetailReportQueryRq` / `GeneralLedger`) rather
     than by re-deriving double-entry from raw transactions. QBD generates the
     implicit balancing entries and, with `<ReportBasis>Cash</ReportBasis>`,
-    computes cash-basis itself. Runs once per basis (Accrual + Cash by default)
-    and tags every row with its basis. See `--gl-basis` / `--no-gl`. GL amounts
+    computes cash-basis itself. Runs Accrual basis by default (add `--gl-basis
+    cash` or `both` for the QBD-computed cash basis) and tags every row with its
+    basis. See `--gl-basis` / `--no-gl`. GL amounts
     are stored as exact decimal STRINGS (never float) so they reconcile to the
     penny downstream.
   - **`--probe-gl`** — a structure probe for the GL report. Run it against the
@@ -1924,9 +1925,10 @@ Examples:
                         '(and this app has unattended access) or already open '
                         'with that same file.')
     p.add_argument('--gl-basis', dest='gl_basis',
-                   choices=['accrual', 'cash', 'both'], default='both',
-                   help='General Ledger report basis to extract (default: both). '
-                        'Cash basis is computed by QBD itself.')
+                   choices=['accrual', 'cash', 'both'], default='accrual',
+                   help='General Ledger report basis to extract (default: accrual). '
+                        'Use "cash" or "both" to also/instead pull QBD-computed '
+                        'cash basis.')
     p.add_argument('--gl-granularity', dest='gl_granularity',
                    choices=['month', 'quarter'], default='month',
                    help='Calendar chunk size for GL report queries (default: month). '

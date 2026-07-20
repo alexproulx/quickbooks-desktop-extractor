@@ -29,13 +29,13 @@ Outputs **21 entity types** in one bundle:
 - Open AR (current open balances)
 
 **Ledger**
-- **General Ledger** — every posting line, on **both Accrual and Cash basis**, pulled through QuickBooks' own report engine so QBD generates the implicit balancing entries and computes cash-basis itself. This is the grain that feeds a Profit & Loss report and transaction-level drill-down.
+- **General Ledger** — every posting line, pulled through QuickBooks' own report engine so QBD generates the implicit balancing entries. Accrual basis by default; QBD can also compute cash basis on request (`--gl-basis cash`/`both`). This is the grain that feeds a Profit & Loss report and transaction-level drill-down.
 
 No Intuit cloud account or API key required. Uses the QB SDK, which talks to a locally-running QuickBooks Desktop / Enterprise instance.
 
 ## What's new in v3
 
-- **General Ledger extraction.** The posting-line ledger, pulled via QuickBooks' report engine (`GeneralDetailReportQueryRq` with `GeneralDetailReportType = GeneralLedger`) rather than by re-deriving double-entry from raw transactions. Letting QBD produce the GL means it generates the implicit balancing entries and — with `<ReportBasis>Cash</ReportBasis>` — computes cash-basis itself, which is otherwise the hardest part of P&L replication. The extractor runs the report once per basis (**Accrual + Cash by default**) and tags every row with its basis. See [General Ledger](#general-ledger) below.
+- **General Ledger extraction.** The posting-line ledger, pulled via QuickBooks' report engine (`GeneralDetailReportQueryRq` with `GeneralDetailReportType = GeneralLedger`) rather than by re-deriving double-entry from raw transactions. Letting QBD produce the GL means it generates the implicit balancing entries and — with `<ReportBasis>Cash</ReportBasis>` — can compute cash-basis itself, which is otherwise the hardest part of P&L replication. The extractor runs **Accrual basis by default** (`--gl-basis cash`/`both` to also pull the QBD-computed cash basis) and tags every row with its basis. See [General Ledger](#general-ledger) below.
 - **GL amounts are exact decimal strings, never floats.** Money display strings (`"1,234.56"`, `"(1,234.56)"`) are parsed to `Decimal` and stored as strings so the GL reconciles to the penny downstream — binary float can't represent decimal cents exactly.
 - **`--probe-gl`** — a structure probe for the GL report. The report response is a `<ReportRet>` shape, not the entity `…Ret` blocks the other extractors parse, and whether it exposes each line's internal TxnID is version-dependent. Run the probe against the real company file first: it dumps the raw report XML and reports which columns come back and whether TxnID (needed for drill-down and attachment linking) is present.
 
@@ -95,7 +95,8 @@ QBExtract.py --corrupt-safe --years 0         # full history, corrupt file
 QBExtract.py --output mybundle.json           # custom output path
 
 QBExtract.py --probe-gl --year 2024           # probe GL report structure, then exit
-QBExtract.py --gl-basis accrual               # GL on accrual basis only (default: both)
+QBExtract.py --gl-basis cash                  # GL on QBD-computed cash basis (default: accrual)
+QBExtract.py --gl-basis both                  # GL on both accrual and cash
 QBExtract.py --gl-granularity quarter         # chunk GL reports by quarter (default: month)
 QBExtract.py --no-gl                          # skip General Ledger extraction
 QBExtract.py --company-file "C:\QB\Company.QBW"   # open a specific file directly
@@ -140,7 +141,7 @@ The General Ledger is the one extractor that does **not** read entity `…Ret` b
 **Why the report engine instead of rebuilding double-entry?** QuickBooks stores transactions (checks, deposits, journal entries, inventory adjustments, …), not a flat ledger. You could pull every posting transaction type and re-implement QBD's posting logic to derive the GL yourself, but that means re-deriving the implicit balancing entries *and* cash-basis conversion — months of work that rarely reconciles exactly. Letting QBD produce the GL means the report already contains the balancing entries, and running it with `<ReportBasis>Cash</ReportBasis>` gets QBD's own cash-basis numbers for free.
 
 **How it runs:**
-- Once per basis. `--gl-basis both` (default) runs Accrual and Cash; each posting line is tagged with `basis` and appears once per basis.
+- Accrual basis by default. `--gl-basis cash` pulls QBD-computed cash basis instead; `--gl-basis both` pulls both, tagging each posting line with its `basis`.
 - Chunked by calendar period (`--gl-granularity month` by default, or `quarter`). Each chunk is one `ReportPeriod`; a failed period is logged and skipped rather than losing the whole ledger — the same failure-isolation idea as the transaction extractors' year chunks.
 - Amounts are parsed from the report's display strings to `Decimal` and stored as strings — never `float()`.
 
@@ -157,7 +158,24 @@ against the real company file. The probe runs one small GL report, writes the ra
 
 The extractor captures TxnID when present and leaves it empty when not, so it works either way — but knowing which case you're in determines how the downstream drill-down is built.
 
-> **Correctness gate:** before trusting the GL, reconcile one full period to a native QuickBooks P&L (Reports → Company & Financial → Profit & Loss) to the penny, for both bases. Sum the `general_ledger` amounts for income/COGS/expense accounts over the period and compare.
+> **Correctness gate:** before trusting the GL, reconcile one full period to a native QuickBooks P&L (Reports → Company & Financial → Profit & Loss) to the penny. Run `reconcile_pnl.py` on the export (see [Reconciling to QuickBooks](#reconciling-to-quickbooks)) and compare its NET INCOME and section totals against QuickBooks' P&L for the same period and basis.
+
+## Reconciling to QuickBooks
+
+`reconcile_pnl.py` reads an export bundle and rebuilds a QuickBooks-style Profit & Loss from the `general_ledger` posting lines, so you can compare it — to the penny — against QuickBooks' own report. It touches no QuickBooks and needs no Windows (it only reads the JSON), so run it anywhere, including on a Mac:
+
+```bash
+python reconcile_pnl.py "Switch Broker Network Inc__export_20260720.json"
+python reconcile_pnl.py bundle.json --basis cash        # if you pulled cash basis
+python reconcile_pnl.py bundle.json --totals-only       # section totals only
+python reconcile_pnl.py bundle.json --csv pnl.csv       # also write accounts x basis CSV
+```
+
+It prints Income / COGS / Gross Profit / Expense / Net Ordinary Income / Other Income / Other Expense / **Net Income**, grouped and indented by account hierarchy, plus a **Ledger balances** check (the sum of *all* posting amounts must be `0.00` — if it isn't, a chunk failed or rows are missing) and a count of any GL lines whose account type couldn't be classified.
+
+To reconcile: in QuickBooks run **Reports → Company & Financial → Profit & Loss**, set the date range to the export's period and the basis to match, and compare the section totals and Net Income. They should tie exactly.
+
+**Sign convention:** QuickBooks' GL Amount column is debit-positive / credit-negative, so income accounts sum negative and expenses sum positive in the raw ledger. `reconcile_pnl.py` negates income so the P&L reads normally (income and expenses both positive, Net Income = Income − Expenses). If your totals come out sign-flipped, the convention is isolated in one `DISPLAY_SIGN` table at the top of the script.
 
 ## Output format
 
@@ -172,7 +190,7 @@ Single JSON file:
     "date_range": null,
     "corrupt_safe": false,
     "gl": true,
-    "gl_basis": "both",
+    "gl_basis": "accrual",
     "gl_granularity": "month",
     "extractor": "QBExtract v3.0"
   },
@@ -221,7 +239,7 @@ Each `general_ledger` element is one posting line:
 }
 ```
 
-- `amount` is an **exact decimal string** (never a float) so downstream sums reconcile to the penny. `basis` is `"Accrual"` or `"Cash"`; with the default `--gl-basis both`, every posting line appears once per basis.
+- `amount` is an **exact decimal string** (never a float) so downstream sums reconcile to the penny. `basis` is `"Accrual"` or `"Cash"`; by default only accrual is pulled, and with `--gl-basis both` every posting line appears once per basis.
 - `account_full_name` / `account_list_id` / `account_type` are enriched by joining the report's account back to the extracted chart of accounts (by ListID, then FullName, then Name) rather than trusting the report's display text — this is what feeds P&L classification (Income / COGS / Expense) and sub-account roll-up.
 - `txn_id` is the internal transaction GUID **when the report exposes it** (see the probe note below); otherwise it is empty and downstream must link on `txn_type` + `ref_number` + `date` + `amount`.
 
