@@ -95,6 +95,7 @@ QBExtract.py --corrupt-safe --years 0         # full history, corrupt file
 QBExtract.py --output mybundle.json           # custom output path
 
 QBExtract.py --probe-gl --year 2024           # probe GL report structure, then exit
+QBExtract.py --year 2024 --gl-only            # ONLY accounts + General Ledger (for P&L)
 QBExtract.py --gl-basis cash                  # GL on QBD-computed cash basis (default: accrual)
 QBExtract.py --gl-basis both                  # GL on both accrual and cash
 QBExtract.py --gl-granularity quarter         # chunk GL reports by quarter (default: month)
@@ -142,6 +143,7 @@ The General Ledger is the one extractor that does **not** read entity `…Ret` b
 
 **How it runs:**
 - Accrual basis by default. `--gl-basis cash` pulls QBD-computed cash basis instead; `--gl-basis both` pulls both, tagging each posting line with its `basis`.
+- **`--gl-only`** extracts just what a P&L needs — the chart of accounts plus the General Ledger — and skips every other master and transaction table. Because customers and items alone are 70+ name-range queries, this cuts the SDK query count (and thus the number of session opens that can hang) by an order of magnitude. Use it for the P&L pipeline; use the full extract only when you also need the ERP-migration tables.
 - Chunked by calendar period (`--gl-granularity month` by default, or `quarter`). Each chunk is one `ReportPeriod`; a failed period is logged and skipped rather than losing the whole ledger — the same failure-isolation idea as the transaction extractors' year chunks.
 - Amounts are parsed from the report's display strings to `Decimal` and stored as strings — never `float()`.
 
@@ -189,6 +191,7 @@ Single JSON file:
     "years_back": 3,
     "date_range": null,
     "corrupt_safe": false,
+    "gl_only": false,
     "gl": true,
     "gl_basis": "accrual",
     "gl_granularity": "month",

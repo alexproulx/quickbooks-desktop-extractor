@@ -1896,6 +1896,11 @@ Examples:
                         'Smaller chunks isolate failures to a shorter period.')
     p.add_argument('--no-gl', dest='no_gl', action='store_true',
                    help='Skip General Ledger extraction.')
+    p.add_argument('--gl-only', dest='gl_only', action='store_true',
+                   help='Extract only what a P&L needs: chart of accounts + '
+                        'General Ledger. Skips all other masters and every '
+                        'transaction table. Far fewer SDK queries, so faster and '
+                        'much less exposure to per-open hangs.')
     p.add_argument('--probe-gl', dest='probe_gl', action='store_true',
                    help='Run the GL report structure probe (TxnID check) and exit. '
                         'Run this against the real company file FIRST.')
@@ -1979,35 +1984,56 @@ def main():
             'years_back':     years,
             'date_range':     date_range,
             'corrupt_safe':   args.corrupt_safe,
+            'gl_only':        args.gl_only,
             'gl':             not args.no_gl,
             'gl_basis':       args.gl_basis,
             'gl_granularity': args.gl_granularity,
             'extractor':      'QBExtract v3.0',
         }
 
-        # Masters first
+        # Accounts always run: needed for GL P&L classification + hierarchy.
         bundle['accounts']           = extract_accounts(session)
-        bundle['terms']              = extract_terms(session)
-        bundle['ship_methods']       = extract_ship_methods(session)
-        bundle['payment_methods']    = extract_payment_methods(session)
-        bundle['sales_tax_codes']    = extract_sales_tax_codes(session)
-        bundle['sales_tax_items']    = extract_sales_tax_items(session)
-        bundle['sales_reps']         = extract_sales_reps(session)
-        bundle['price_levels']       = extract_price_levels(session)
-        bundle['quantity_discounts'] = extract_quantity_discounts(session)
-        bundle['vendors']            = extract_vendors(session)
-        bundle['items']              = extract_items(session, corrupt_safe=args.corrupt_safe)
-        bundle['customers']          = extract_customers(session, corrupt_safe=args.corrupt_safe)
 
-        # Transactions
-        bundle['invoices']           = extract_invoices(session, years, date_range)
-        bundle['payments']           = extract_payments(session, years, date_range)
-        bundle['credit_memos']       = extract_credit_memos(session, years, date_range)
-        bundle['sales_orders']       = extract_sales_orders(session, date_range)
-        bundle['purchase_orders']    = extract_purchase_orders(session, date_range)
-        bundle['bills']              = extract_bills(session, years, date_range)
-        bundle['bill_payments']      = extract_bill_payments(session, years, date_range)
-        bundle['open_ar']            = extract_open_ar(session)
+        # Everything below is for the full ERP-migration bundle and is NOT
+        # needed to reproduce a P&L from the GL. --gl-only skips it, which also
+        # cuts the query/BeginSession count dramatically (customers + items
+        # alone are 70+ name-range queries) — faster and far less exposure to
+        # the SDK's per-open hang risk.
+        _SKIPPED_SECTIONS = (
+            'terms', 'ship_methods', 'payment_methods', 'sales_tax_codes',
+            'sales_tax_items', 'sales_reps', 'price_levels', 'quantity_discounts',
+            'vendors', 'items', 'customers', 'invoices', 'payments',
+            'credit_memos', 'sales_orders', 'purchase_orders', 'bills',
+            'bill_payments', 'open_ar',
+        )
+        if args.gl_only:
+            print("  [--gl-only] skipping masters and transaction extracts "
+                  "(accounts + general ledger only)")
+            for k in _SKIPPED_SECTIONS:
+                bundle[k] = []
+        else:
+            # Masters
+            bundle['terms']              = extract_terms(session)
+            bundle['ship_methods']       = extract_ship_methods(session)
+            bundle['payment_methods']    = extract_payment_methods(session)
+            bundle['sales_tax_codes']    = extract_sales_tax_codes(session)
+            bundle['sales_tax_items']    = extract_sales_tax_items(session)
+            bundle['sales_reps']         = extract_sales_reps(session)
+            bundle['price_levels']       = extract_price_levels(session)
+            bundle['quantity_discounts'] = extract_quantity_discounts(session)
+            bundle['vendors']            = extract_vendors(session)
+            bundle['items']              = extract_items(session, corrupt_safe=args.corrupt_safe)
+            bundle['customers']          = extract_customers(session, corrupt_safe=args.corrupt_safe)
+
+            # Transactions
+            bundle['invoices']           = extract_invoices(session, years, date_range)
+            bundle['payments']           = extract_payments(session, years, date_range)
+            bundle['credit_memos']       = extract_credit_memos(session, years, date_range)
+            bundle['sales_orders']       = extract_sales_orders(session, date_range)
+            bundle['purchase_orders']    = extract_purchase_orders(session, date_range)
+            bundle['bills']              = extract_bills(session, years, date_range)
+            bundle['bill_payments']      = extract_bill_payments(session, years, date_range)
+            bundle['open_ar']            = extract_open_ar(session)
 
         # General Ledger (report engine — Option A). Wrapped so a report-engine
         # failure never loses the rest of the bundle.
@@ -2058,17 +2084,18 @@ def main():
     print("=" * 60)
     print(f"  Company:           {session.company_name}")
     print(f"  Accounts:          {len(bundle['accounts'])}")
-    print(f"  Customers:         {len(bundle['customers'])}")
-    print(f"  Items:             {len(bundle['items'])}")
-    print(f"  Vendors:           {len(bundle['vendors'])}")
-    print(f"  Invoices:          {len(bundle['invoices'])}")
-    print(f"  Payments:          {len(bundle['payments'])}")
-    print(f"  Credit Memos:      {len(bundle['credit_memos'])}")
-    print(f"  Sales Orders:      {len(bundle['sales_orders'])}")
-    print(f"  Purchase Orders:   {len(bundle['purchase_orders'])}")
-    print(f"  Vendor Bills:      {len(bundle['bills'])}")
-    print(f"  Bill Payments:     {len(bundle['bill_payments'])}")
-    print(f"  Open AR items:     {len(bundle['open_ar'])}")
+    if not args.gl_only:
+        print(f"  Customers:         {len(bundle['customers'])}")
+        print(f"  Items:             {len(bundle['items'])}")
+        print(f"  Vendors:           {len(bundle['vendors'])}")
+        print(f"  Invoices:          {len(bundle['invoices'])}")
+        print(f"  Payments:          {len(bundle['payments'])}")
+        print(f"  Credit Memos:      {len(bundle['credit_memos'])}")
+        print(f"  Sales Orders:      {len(bundle['sales_orders'])}")
+        print(f"  Purchase Orders:   {len(bundle['purchase_orders'])}")
+        print(f"  Vendor Bills:      {len(bundle['bills'])}")
+        print(f"  Bill Payments:     {len(bundle['bill_payments'])}")
+        print(f"  Open AR items:     {len(bundle['open_ar'])}")
     gl = bundle.get('general_ledger', [])
     print(f"  General Ledger:    {len(gl)} lines")
     if gl:
@@ -2078,8 +2105,6 @@ def main():
         for b in sorted(by_basis):
             print(f"    {b} basis:       {by_basis[b]} lines")
     print(f"  File:              {filename}  ({size_mb:.1f} MB)")
-    print()
-    print("Send this file to your ERP consultant for import.")
     print()
     _pause_before_exit(args)
 
