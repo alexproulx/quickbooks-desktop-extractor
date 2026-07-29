@@ -10,6 +10,17 @@ Build a UI that reads the JSON bundle produced by `QBExtract.py` and reconstruct
 
 There is already a reference implementation of the P&L math in **`reconcile_pnl.py`** (Python) in this repo. It reads the same bundle and prints a correct QuickBooks-matching P&L. **Use it as your oracle**: run it on the same file and make your UI's section totals and Net Income match it to the penny. Read it before you start — it encodes every rule below.
 
+**A sample bundle to develop against ships with this repo: `docs/sample_bundle.json`.**
+It is synthetic but schema-identical to a real export: 1,244 GL lines across
+**3 years (2022–2024), every month populated**, a numbered chart with
+sub-accounts, all five P&L account types plus balance-sheet accounts, correct
+double-entry (balances to 0.00), both amount signs, ~380 `-SPLIT-` lines, ~310
+blank `ref_number` lines, a mix of populated and empty `txn_id`, and four
+`class` values. It has a deliberate year-over-year growth trend (Net Income
+≈ 84k → 174k → 292k) so period-comparison views show meaningful movement.
+Validate against it with `python reconcile_pnl.py docs/sample_bundle.json`
+(Net Income for 2022–2024 = 550,657.01; ledger balances to 0.00).
+
 ---
 
 ## Where the data comes from (context)
