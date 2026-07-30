@@ -1534,16 +1534,24 @@ def _index_accounts(accounts):
 
 
 def _match_report_account(label, idx):
-    """Match a GL report account label ("<number> . <name>", or a bare name) to
-    a master account dict, or None. Exact full_name/name first, then by the
-    account number parsed from the "<number> . <name>" form."""
+    """Match a GL report account label to a master account dict, or None.
+
+    The GL report's account value can be a full colon-separated path with a
+    numbered segment at EACH level, e.g.
+      "62.0000 . SBN Corporate Overhead:62.1030 . Legal Services Expense"
+    (arbitrary depth). The account the line actually posts to is the LEAF (the
+    last ':'-segment); the leading segments are ancestors. Matching the first
+    number token would resolve to the top-level parent and flatten every
+    sub-account onto its ancestor — so match on the LEAF's number, then name."""
     label = (label or '').strip()
     if not label:
         return None
+    # Whole-label exact match first (bare names, already-clean name paths).
     hit = idx['by_full_name'].get(label) or idx['by_name'].get(label)
     if hit:
         return hit
-    m = _ACCT_LABEL_RE.match(label)
+    leaf = label.split(':')[-1].strip()   # the account actually posted to
+    m = _ACCT_LABEL_RE.match(leaf)
     if m:
         num, rest = m.group(1).strip(), m.group(2).strip()
         hit = idx['by_number'].get(num)
@@ -1552,7 +1560,8 @@ def _match_report_account(label, idx):
         hit = idx['by_full_name'].get(rest) or idx['by_name'].get(rest)
         if hit:
             return hit
-    return None
+    # Leaf with no "<number> . " prefix (a bare account name).
+    return idx['by_full_name'].get(leaf) or idx['by_name'].get(leaf)
 
 
 def parse_general_ledger_report(xml, basis, accounts_index=None):
