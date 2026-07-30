@@ -121,12 +121,18 @@ def _classify(row, idx):
     return full, row.get('account_type', '')
 
 
-def build_pnl(bundle, basis):
+def build_pnl(bundle, basis, from_date=None, to_date=None):
     """Aggregate the bundle's general_ledger for one basis into per-account and
-    per-type totals. Returns a dict with account sums, type sums, and the
-    all-accounts control total (should be ~0 for a complete double-entry set)."""
+    per-type totals. Optionally restrict to posting lines whose date falls in
+    [from_date, to_date] (inclusive; either bound may be None). Returns a dict
+    with account sums, type sums, and the all-accounts control total (should be
+    ~0 for a complete double-entry set within the window)."""
     idx = _index_accounts(bundle.get('accounts'))
     gl = [r for r in bundle.get('general_ledger', []) if r.get('basis') == basis]
+    if from_date or to_date:
+        # ISO YYYY-MM-DD dates compare correctly as strings.
+        lo, hi = from_date or '', to_date or '9999-12-31'
+        gl = [r for r in gl if lo <= (r.get('date') or '') <= hi]
 
     per_account = {}      # full_name -> {'type':.., 'raw': Decimal}
     control_total = Decimal('0')   # sum of ALL raw amounts (all account types)
@@ -147,6 +153,7 @@ def build_pnl(bundle, basis):
     return {
         'basis': basis,
         'lines': len(gl),
+        'window': (from_date, to_date),
         'per_account': per_account,
         'control_total': control_total,
         'unclassified': unclassified,
@@ -190,6 +197,9 @@ def print_pnl(pnl, totals_only=False, out=sys.stdout):
 
     print("=" * (W + 18), file=out)
     print(f"  PROFIT & LOSS — {pnl['basis']} basis", file=out)
+    frm, to = pnl.get('window', (None, None))
+    if frm or to:
+        print(f"  Period: {frm or 'start'} to {to or 'end'}", file=out)
     print(f"  ({pnl['lines']} GL posting lines)", file=out)
     print("=" * (W + 18), file=out)
 
@@ -270,6 +280,11 @@ def main():
                     help='Which basis to report (default: accrual).')
     ap.add_argument('--totals-only', action='store_true',
                     help='Print section totals only, not individual accounts.')
+    ap.add_argument('--from', dest='from_date', default=None, metavar='YYYY-MM-DD',
+                    help='Only include posting lines on/after this date.')
+    ap.add_argument('--to', dest='to_date', default=None, metavar='YYYY-MM-DD',
+                    help='Only include posting lines on/before this date. '
+                         'Use with --from to reconcile a single month/quarter.')
     ap.add_argument('--csv', default=None,
                     help='Also write a per-account CSV (accounts x basis).')
     args = ap.parse_args()
@@ -301,7 +316,7 @@ def main():
         if basis not in available:
             print(f"\n(skipping {basis} — not present in bundle)")
             continue
-        pnl = build_pnl(bundle, basis)
+        pnl = build_pnl(bundle, basis, args.from_date, args.to_date)
         print()
         print_pnl(pnl, totals_only=args.totals_only)
         pnls.append(pnl)

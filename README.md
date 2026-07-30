@@ -198,8 +198,11 @@ Each yearly file includes the chart of accounts, so `reconcile_pnl.py` works on 
 python reconcile_pnl.py "Switch Broker Network Inc__export_20260720.json"
 python reconcile_pnl.py bundle.json --basis cash        # if you pulled cash basis
 python reconcile_pnl.py bundle.json --totals-only       # section totals only
+python reconcile_pnl.py bundle.json --from 2024-01-01 --to 2024-01-31   # one month
 python reconcile_pnl.py bundle.json --csv pnl.csv       # also write accounts x basis CSV
 ```
+
+`--from` / `--to` (inclusive, either optional) restrict the P&L to a date window — reconcile a single month or quarter directly against QuickBooks' P&L for the same period. Handy for localizing a discrepancy to one period.
 
 It prints Income / COGS / Gross Profit / Expense / Net Ordinary Income / Other Income / Other Expense / **Net Income**, grouped and indented by account hierarchy, plus a **Ledger balances** check (the sum of *all* posting amounts must be `0.00` — if it isn't, a chunk failed or rows are missing) and a count of any GL lines whose account type couldn't be classified.
 
