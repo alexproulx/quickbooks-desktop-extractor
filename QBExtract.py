@@ -1661,9 +1661,19 @@ def parse_general_ledger_report(xml, basis, accounts_index=None):
         # A real posting line has a transaction type and/or an amount. Account
         # header, opening-balance and beginning-balance rows have neither (only
         # a label plus a running balance) and are dropped. Running balances are
-        # recomputed downstream, so nothing is lost.
+        # recomputed downstream, so nothing is lost. (This check must run while a
+        # blank amount is still '' — see the 0.00 default just below.)
         if not (rec['txn_type'] or rec['amount']):
             continue
+
+        # A kept posting line always gets a numeric amount string. Genuinely
+        # blank amount cells ($0 memo/annotation lines, e.g. a "confirm GL"
+        # note) become "0.00" so downstream sums never encounter an empty
+        # string (which naive parsers turn into NaN and corrupt a period total).
+        # Only truly blank cells are zeroed; a non-blank-but-unparseable value
+        # was left as '' above and stays flagged rather than silently zeroed.
+        if rec['amount'] == '':
+            rec['amount'] = '0.00'
 
         acct_name = cur_account
         acct_type = ''
